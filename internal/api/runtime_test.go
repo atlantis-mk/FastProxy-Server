@@ -426,7 +426,7 @@ func TestSingBoxRouteUsesGlobalRouteFields(t *testing.T) {
 		DNSServers: []repository.GlobalDNSServer{
 			{Name: "default-1", Role: "default"},
 		},
-	}, nil)
+	}, nil, nil, nil)
 
 	expected := map[string]any{
 		"rules": singBoxDefaultRouteRules(),
@@ -451,7 +451,7 @@ func TestSingBoxRouteFallsBackToFirstDNSResolver(t *testing.T) {
 		DNSServers: []repository.GlobalDNSServer{
 			{Name: "proxy-1", Role: "proxy"},
 		},
-	}, nil)
+	}, nil, nil, nil)
 
 	expected := map[string]any{
 		"rules": singBoxDefaultRouteRules(),
@@ -468,7 +468,7 @@ func TestSingBoxRouteFallsBackToFirstDNSResolver(t *testing.T) {
 func TestSingBoxRoutePrependsDefaultRules(t *testing.T) {
 	route := singBoxRoute(repository.GlobalConfig{}, []repository.NormalizedRule{
 		{Fields: map[string]any{"domain": []string{"example.com"}}, Action: "route", Outbound: "DIRECT"},
-	})
+	}, nil, nil)
 
 	expectedRules := append(singBoxDefaultRouteRules(), map[string]any{
 		"domain":   []string{"example.com"},
@@ -546,7 +546,7 @@ func TestSingBoxOutboundsDoNotLeakClashGroupRawFields(t *testing.T) {
 	}
 }
 
-func TestSingBoxRulesSkipRemovedGeoIPRules(t *testing.T) {
+func TestSingBoxRulesConvertGeoIPToBuiltInRuleSet(t *testing.T) {
 	rules := singBoxRules([]repository.NormalizedRule{
 		{
 			Fields:   map[string]any{"geoip": []string{"cn"}},
@@ -559,13 +559,34 @@ func TestSingBoxRulesSkipRemovedGeoIPRules(t *testing.T) {
 		},
 	})
 
-	expected := []map[string]any{{"action": "route", "outbound": "MATCH"}}
+	expected := []map[string]any{
+		{"rule_set": []string{"geoip-cn"}, "action": "route", "outbound": "DIRECT"},
+		{"action": "route", "outbound": "MATCH"},
+	}
 	if !reflect.DeepEqual(rules, expected) {
 		t.Fatalf("singBoxRules() = %#v, want %#v", rules, expected)
 	}
 }
 
-func TestSingBoxRulesSkipLogicalRuleWhenGeoIPChildrenAreRemoved(t *testing.T) {
+func TestSingBoxRouteAddsBuiltInGeoIPRuleSets(t *testing.T) {
+	route := singBoxRoute(repository.GlobalConfig{}, []repository.NormalizedRule{
+		{Fields: map[string]any{"geoip": []string{"CN"}}, Action: "route", Outbound: "DIRECT"},
+	}, nil, nil)
+
+	expected := []map[string]any{
+		{
+			"type":   "remote",
+			"tag":    "geoip-cn",
+			"format": "binary",
+			"url":    "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
+		},
+	}
+	if !reflect.DeepEqual(route["rule_set"], expected) {
+		t.Fatalf("route rule_set = %#v, want %#v", route["rule_set"], expected)
+	}
+}
+
+func TestSingBoxRulesSkipLogicalRuleWhenSourceGeoIPChildrenAreRemoved(t *testing.T) {
 	rules := singBoxRules([]repository.NormalizedRule{
 		{
 			Type:   "logical",

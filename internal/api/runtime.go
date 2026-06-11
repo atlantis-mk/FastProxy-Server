@@ -196,7 +196,7 @@ func (s *Server) compileRuntime(ctx context.Context, active repository.ProfileRe
 		data, err := marshalMihomoRuntimeConfig(mihomoRuntimeConfig(bootstrap.Config, nodes, groups, rules, externalController))
 		return compiledRuntime{Data: data, ExternalController: externalController, Secret: secret}, err
 	case repository.CoreSingBox:
-		data, err := json.MarshalIndent(singBoxRuntimeConfig(bootstrap.Config, nodes, groups, rules, externalController, runtimeCompileOptions{
+		data, err := json.MarshalIndent(singBoxRuntimeConfig(bootstrap.Config, nodes, groups, rules, bootstrap.SingBoxRuleSets, bootstrap.RuleSourceRepositories, externalController, runtimeCompileOptions{
 			SingBoxDNS14: singBoxSupportsDNS14(ctx, binaryPath),
 		}), "", "  ")
 		return compiledRuntime{Data: data, ExternalController: externalController, Secret: secret}, err
@@ -623,7 +623,7 @@ func mihomoAuthentication(config repository.GlobalConfig) []string {
 	return items
 }
 
-func singBoxRuntimeConfig(config repository.GlobalConfig, nodes []repository.NormalizedNode, groups []repository.NormalizedGroup, rules []repository.NormalizedRule, externalController string, options runtimeCompileOptions) map[string]any {
+func singBoxRuntimeConfig(config repository.GlobalConfig, nodes []repository.NormalizedNode, groups []repository.NormalizedGroup, rules []repository.NormalizedRule, ruleSets []repository.SingBoxRuleSetResource, repositories []repository.RuleSourceRepository, externalController string, options runtimeCompileOptions) map[string]any {
 	clashAPI := map[string]any{"external_controller": externalController}
 	setString(clashAPI, "secret", stringField(config.Fields, "secret", ""))
 
@@ -631,7 +631,7 @@ func singBoxRuntimeConfig(config repository.GlobalConfig, nodes []repository.Nor
 		"log":          map[string]any{"level": stringField(config.Fields, "logLevel", "info")},
 		"inbounds":     singBoxInbounds(config.Inbounds),
 		"outbounds":    singBoxOutbounds(nodes, groups),
-		"route":        singBoxRoute(config, rules),
+		"route":        singBoxRoute(config, rules, ruleSets, repositories),
 		"dns":          singBoxDNS(config, options),
 		"experimental": map[string]any{"clash_api": clashAPI},
 	}
@@ -821,6 +821,43 @@ func splitLines(value string) []string {
 	return lines
 }
 
+func stringValues(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return append([]string(nil), typed...)
+	case []any:
+		values := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if value, ok := item.(string); ok {
+				values = append(values, value)
+			}
+		}
+		return values
+	case string:
+		return []string{typed}
+	default:
+		return nil
+	}
+}
+
+func appendUniqueStrings(values []string, additions ...string) []string {
+	result := make([]string, 0, len(values)+len(additions))
+	seen := map[string]bool{}
+	for _, value := range append(values, additions...) {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
+}
+
+func singBoxGeoIPCode(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
 func setString(target map[string]any, key string, value string) {
 	if strings.TrimSpace(value) != "" {
 		target[key] = strings.TrimSpace(value)
@@ -980,10 +1017,14 @@ func singBoxRules(rules []repository.NormalizedRule) []map[string]any {
 }
 
 func singBoxRule(rule repository.NormalizedRule) (map[string]any, bool) {
-	if singBoxRuleHasRemovedGeoIP(rule) {
+	if singBoxRuleHasRemovedSourceGeoIP(rule) {
 		return nil, false
 	}
 	item := copyMap(rule.Fields)
+	if geoIPValues := stringValues(item["geoip"]); len(geoIPValues) > 0 {
+		delete(item, "geoip")
+		item["rule_set"] = appendUniqueStrings(stringValues(item["rule_set"]), singBoxBuiltInGeoIPRuleSetTags(geoIPValues)...)
+	}
 	if rule.Type != "" {
 		item["type"] = rule.Type
 	}
@@ -1006,18 +1047,27 @@ func singBoxRule(rule repository.NormalizedRule) (map[string]any, bool) {
 	return item, len(item) > 0
 }
 
-func singBoxRuleHasRemovedGeoIP(rule repository.NormalizedRule) bool {
-	for _, key := range []string{"geoip", "source_geoip"} {
-		if _, ok := rule.Fields[key]; ok {
-			return true
-		}
-	}
-	return false
+func singBoxRuleHasRemovedSourceGeoIP(rule repository.NormalizedRule) bool {
+	_, ok := rule.Fields["source_geoip"]
+	return ok
 }
 
-func singBoxRoute(config repository.GlobalConfig, rules []repository.NormalizedRule) map[string]any {
+func singBoxBuiltInGeoIPRuleSetTags(values []string) []string {
+	tags := make([]string, 0, len(values))
+	for _, value := range values {
+		if code := singBoxGeoIPCode(value); code != "" {
+			tags = append(tags, "geoip-"+code)
+		}
+	}
+	return appendUniqueStrings(nil, tags...)
+}
+
+func singBoxRoute(config repository.GlobalConfig, rules []repository.NormalizedRule, ruleSets []repository.SingBoxRuleSetResource, repositories []repository.RuleSourceRepository) map[string]any {
 	fields := config.Fields
 	route := map[string]any{"rules": append(singBoxDefaultRouteRules(), singBoxRules(rules)...)}
+	if renderedRuleSets := singBoxRouteRuleSets(rules, ruleSets, repositories); len(renderedRuleSets) > 0 {
+		route["rule_set"] = renderedRuleSets
+	}
 	if resolver := singBoxDefaultDomainResolver(config); len(resolver) > 0 {
 		route["default_domain_resolver"] = resolver
 	}
@@ -1032,6 +1082,85 @@ func singBoxRoute(config repository.GlobalConfig, rules []repository.NormalizedR
 		route["default_mark"] = mark
 	}
 	return route
+}
+
+func singBoxRouteRuleSets(rules []repository.NormalizedRule, ruleSets []repository.SingBoxRuleSetResource, repositories []repository.RuleSourceRepository) []map[string]any {
+	items := []map[string]any{}
+	seen := map[string]bool{}
+	for _, item := range singBoxConfiguredRuleSets(ruleSets, repositories) {
+		if tag, ok := item["tag"].(string); ok && tag != "" && !seen[tag] {
+			seen[tag] = true
+			items = append(items, item)
+		}
+	}
+	for _, tag := range singBoxReferencedBuiltInGeoIPRuleSetTags(rules) {
+		if seen[tag] {
+			continue
+		}
+		seen[tag] = true
+		items = append(items, singBoxBuiltInGeoIPRuleSet(tag))
+	}
+	return items
+}
+
+func singBoxConfiguredRuleSets(ruleSets []repository.SingBoxRuleSetResource, repositories []repository.RuleSourceRepository) []map[string]any {
+	repositoriesByID := map[string]repository.RuleSourceRepository{}
+	for _, repo := range repositories {
+		repositoriesByID[repo.ID] = repo
+	}
+
+	items := make([]map[string]any, 0, len(ruleSets))
+	for _, ruleSet := range ruleSets {
+		item := map[string]any{
+			"tag":    ruleSet.Tag,
+			"format": ruleSet.Format,
+		}
+		switch ruleSet.SourceMode {
+		case repository.RuleAssetSourceModeRepositoryFile:
+			repo, ok := repositoriesByID[ruleSet.RepositoryID]
+			if !ok {
+				continue
+			}
+			rawURL, err := repository.BuildRepositoryRawURL(repo, repository.CoreSingBox, ruleSet.Path, ruleSet.Ref)
+			if err != nil {
+				continue
+			}
+			item["type"] = "remote"
+			item["url"] = rawURL
+		case repository.RuleAssetSourceModeRemote:
+			item["type"] = "remote"
+			item["url"] = ruleSet.URL
+		case repository.RuleAssetSourceModeLocal:
+			item["type"] = "local"
+			item["path"] = ruleSet.LocalPath
+		default:
+			continue
+		}
+		setString(item, "update_interval", ruleSet.UpdateInterval)
+		items = append(items, item)
+	}
+	return items
+}
+
+func singBoxReferencedBuiltInGeoIPRuleSetTags(rules []repository.NormalizedRule) []string {
+	tags := []string{}
+	for _, rule := range rules {
+		tags = append(tags, singBoxBuiltInGeoIPRuleSetTags(stringValues(rule.Fields["geoip"]))...)
+		if len(rule.Rules) > 0 {
+			tags = append(tags, singBoxReferencedBuiltInGeoIPRuleSetTags(rule.Rules)...)
+		}
+	}
+	return appendUniqueStrings(nil, tags...)
+}
+
+func singBoxBuiltInGeoIPRuleSet(tag string) map[string]any {
+	code := strings.TrimPrefix(tag, "geoip-")
+	return map[string]any{
+		"type":   "remote",
+		"tag":    tag,
+		"format": "binary",
+		"url":    "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/" + url.PathEscape(code) + ".srs",
+	}
 }
 
 func singBoxDefaultRouteRules() []map[string]any {
