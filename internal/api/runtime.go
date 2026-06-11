@@ -25,6 +25,7 @@ import (
 
 const defaultExternalController = "127.0.0.1:9090"
 const singBoxFakeIPServerTag = "fakeip"
+const singBoxBuiltInGeoIPRepositoryID = "metacubex-meta-rules-dat"
 
 func (s *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request) {
 	status := s.sv.Status()
@@ -1098,7 +1099,7 @@ func singBoxRouteRuleSets(rules []repository.NormalizedRule, ruleSets []reposito
 			continue
 		}
 		seen[tag] = true
-		items = append(items, singBoxBuiltInGeoIPRuleSet(tag))
+		items = append(items, singBoxBuiltInGeoIPRuleSet(tag, repositories))
 	}
 	return items
 }
@@ -1153,13 +1154,23 @@ func singBoxReferencedBuiltInGeoIPRuleSetTags(rules []repository.NormalizedRule)
 	return appendUniqueStrings(nil, tags...)
 }
 
-func singBoxBuiltInGeoIPRuleSet(tag string) map[string]any {
+func singBoxBuiltInGeoIPRuleSet(tag string, repositories []repository.RuleSourceRepository) map[string]any {
 	code := strings.TrimPrefix(tag, "geoip-")
+	ruleSetURL := "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/" + url.PathEscape(code) + ".srs"
+	for _, repo := range repositories {
+		if repo.ID != singBoxBuiltInGeoIPRepositoryID {
+			continue
+		}
+		if rawURL, err := repository.BuildRepositoryRawURL(repo, repository.CoreSingBox, "geo/geoip/"+code+".srs", ""); err == nil {
+			ruleSetURL = rawURL
+		}
+		break
+	}
 	return map[string]any{
 		"type":   "remote",
 		"tag":    tag,
 		"format": "binary",
-		"url":    "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/" + url.PathEscape(code) + ".srs",
+		"url":    ruleSetURL,
 	}
 }
 
