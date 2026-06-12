@@ -383,6 +383,7 @@ func normalizeClashProxy(proxy map[string]any, index int) repository.NormalizedN
 		copyIfPresent(normalizedTransport, "reserved", transport["reserved"])
 		copyIfPresent(normalizedTransport, "mtu", transport["mtu"])
 	}
+	normalizeClashCommonProxyFields(normalizedTransport, transport)
 
 	if network := stringValue(transport["network"], ""); network != "" {
 		switch network {
@@ -413,6 +414,89 @@ func normalizeClashProxy(proxy map[string]any, index int) repository.NormalizedN
 		Transport:  normalizedTransport,
 		Raw:        proxy,
 	})
+}
+
+func normalizeClashCommonProxyFields(normalizedTransport map[string]any, transport map[string]any) {
+	copyIfPresent(normalizedTransport, "detour", transport["detour"], transport["dialer-proxy"])
+	copyIfPresent(normalizedTransport, "bind_interface", transport["bind_interface"], transport["interface-name"])
+	copyIfPresent(normalizedTransport, "inet4_bind_address", transport["inet4_bind_address"])
+	copyIfPresent(normalizedTransport, "inet6_bind_address", transport["inet6_bind_address"])
+	copyIfPresent(normalizedTransport, "bind_address_no_port", transport["bind_address_no_port"])
+	copyIfPresent(normalizedTransport, "routing_mark", transport["routing_mark"], transport["routing-mark"])
+	copyIfPresent(normalizedTransport, "reuse_addr", transport["reuse_addr"])
+	copyIfPresent(normalizedTransport, "netns", transport["netns"])
+	copyIfPresent(normalizedTransport, "connect_timeout", transport["connect_timeout"])
+	copyIfPresent(normalizedTransport, "tcp_fast_open", transport["tcp_fast_open"], transport["tfo"])
+	copyIfPresent(normalizedTransport, "tcp_multi_path", transport["tcp_multi_path"], transport["mptcp"])
+	copyIfPresent(normalizedTransport, "disable_tcp_keep_alive", transport["disable_tcp_keep_alive"])
+	copyIfPresent(normalizedTransport, "tcp_keep_alive", transport["tcp_keep_alive"])
+	copyIfPresent(normalizedTransport, "tcp_keep_alive_interval", transport["tcp_keep_alive_interval"])
+	copyIfPresent(normalizedTransport, "udp_fragment", transport["udp_fragment"])
+	copyIfPresent(normalizedTransport, "domain_resolver", transport["domain_resolver"])
+	copyIfPresent(normalizedTransport, "network_strategy", transport["network_strategy"])
+	copyIfPresent(normalizedTransport, "network_type", transport["network_type"])
+	copyIfPresent(normalizedTransport, "fallback_network_type", transport["fallback_network_type"])
+	copyIfPresent(normalizedTransport, "fallback_delay", transport["fallback_delay"])
+	copyIfPresent(normalizedTransport, "domain_strategy", transport["domain_strategy"])
+	copyIfPresent(normalizedTransport, "udp", transport["udp"])
+	copyIfPresent(normalizedTransport, "mihomo_ip_version", transport["ip-version"])
+	copyIfPresent(normalizedTransport, "multiplex", normalizeClashSmux(transport["smux"]))
+	if _, exists := normalizedTransport["domain_strategy"]; !exists {
+		strategy := singBoxDomainStrategyFromMihomoIPVersion(transport["ip-version"])
+		if strategy == "" {
+			return
+		}
+		normalizedTransport["domain_strategy"] = strategy
+	}
+}
+
+func singBoxDomainStrategyFromMihomoIPVersion(value any) string {
+	switch strings.ToLower(strings.TrimSpace(stringValue(value, ""))) {
+	case "ipv4":
+		return "ipv4_only"
+	case "ipv6":
+		return "ipv6_only"
+	case "ipv4-prefer":
+		return "prefer_ipv4"
+	case "ipv6-prefer":
+		return "prefer_ipv6"
+	default:
+		return ""
+	}
+}
+
+func normalizeClashSmux(value any) map[string]any {
+	smux, ok := value.(map[string]any)
+	if !ok || len(smux) == 0 {
+		return nil
+	}
+	multiplex := map[string]any{}
+	copyIfPresent(multiplex, "enabled", smux["enabled"])
+	copyIfPresent(multiplex, "protocol", smux["protocol"])
+	copyIfPresent(multiplex, "max_connections", smux["max-connections"])
+	copyIfPresent(multiplex, "min_streams", smux["min-streams"])
+	copyIfPresent(multiplex, "max_streams", smux["max-streams"])
+	copyIfPresent(multiplex, "padding", smux["padding"])
+	copyIfPresent(multiplex, "brutal", normalizeClashSmuxBrutal(smux["brutal-opts"]))
+	if len(multiplex) == 0 {
+		return nil
+	}
+	return multiplex
+}
+
+func normalizeClashSmuxBrutal(value any) map[string]any {
+	opts, ok := value.(map[string]any)
+	if !ok || len(opts) == 0 {
+		return nil
+	}
+	brutal := map[string]any{}
+	copyIfPresent(brutal, "enabled", opts["enabled"])
+	copyIfPresent(brutal, "up_mbps", opts["up"])
+	copyIfPresent(brutal, "down_mbps", opts["down"])
+	if len(brutal) == 0 {
+		return nil
+	}
+	return brutal
 }
 
 func normalizeClashRules(lines []string) ([]repository.NormalizedRule, []string) {
@@ -737,7 +821,7 @@ func parseClashLogicalArgs(args []string) ([]repository.NormalizedRule, error) {
 	branches := splitLogicalBranches(payload)
 	result := make([]repository.NormalizedRule, 0, len(branches))
 	for _, branch := range branches {
-		rule, _, err := parseClashRule(branch + ",direct")
+		rule, _, err := parseClashRule(branch + ",DIRECT")
 		if err != nil {
 			return nil, err
 		}
@@ -904,9 +988,9 @@ func filterExtraRuleArgs(values []string) []string {
 func normalizeClashRuleOutbound(value string) string {
 	switch strings.ToUpper(strings.TrimSpace(value)) {
 	case "DIRECT":
-		return "direct"
+		return "DIRECT"
 	case "REJECT", "REJECT-DROP":
-		return "block"
+		return "REJECT"
 	default:
 		return strings.TrimSpace(value)
 	}

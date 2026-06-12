@@ -1,0 +1,2 @@
+internal/webui/dist/*
+!internal/webui/dist/.gitkeep

@@ -398,7 +398,32 @@ type OperationEventPage struct {
 
 type RuleSetResource struct {
 	Metadata
-	Rules []NormalizedRule `json:"rules,omitempty"`
+	SupportedCores []Core              `json:"supportedCores,omitempty"`
+	Rules          []NormalizedRule    `json:"rules,omitempty"`
+	RuleCards      []RoutingRuleCardUI `json:"ruleCards,omitempty"`
+}
+
+type RoutingRuleCardUI struct {
+	Enabled         bool                 `json:"enabled"`
+	ID              string               `json:"id"`
+	Name            string               `json:"name"`
+	OutboundTarget  *RoutingRuleTargetUI `json:"outboundTarget,omitempty"`
+	Rules           []RoutingRuleLeafUI  `json:"rules,omitempty"`
+	SourceRule      *NormalizedRule      `json:"sourceRule,omitempty"`
+	SourceSignature string               `json:"sourceSignature,omitempty"`
+}
+
+type RoutingRuleTargetUI struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+type RoutingRuleLeafUI struct {
+	Condition string `json:"condition"`
+	ID        string `json:"id"`
+	Target    string `json:"target"`
+	Value     any    `json:"value"`
 }
 
 type RuleSourceRepositoryProvider string
@@ -579,13 +604,7 @@ type GlobalDNSRule struct {
 	ClientSubnet string `json:"clientSubnet,omitempty"`
 }
 
-type State struct {
-	ActiveProfileID string    `json:"activeProfileId,omitempty"`
-	UpdatedAt       time.Time `json:"updatedAt"`
-}
-
 type Bootstrap struct {
-	State                  State                        `json:"state"`
 	Profiles               []ProfileResource            `json:"profiles"`
 	Subscriptions          []SubscriptionResource       `json:"subscriptions"`
 	NodeSets               []NodeSetResource            `json:"nodeSets"`

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,15 +105,18 @@ func TestGlobalConfigInitializesAndPersistsDefaultDNS(t *testing.T) {
 	if tun.AutoRoute || tun.AutoDetectInterface || tun.AutoRedirect || tun.StrictRoute {
 		t.Fatalf("tun = %#v, want route flags disabled", tun)
 	}
-	if len(tun.DNSHijack) != 1 || tun.DNSHijack[0] != "127.0.0.1:53" {
+	if len(tun.DNSHijack) != 1 || tun.DNSHijack[0] != "any:53" {
 		t.Fatalf("tun.DNSHijack = %#v, want DNS hijack target", tun.DNSHijack)
+	}
+	if config.Fields["routeBlockQuic"] != true {
+		t.Fatalf("routeBlockQuic = %#v, want default QUIC block enabled", config.Fields["routeBlockQuic"])
 	}
 	filters, ok := config.Fields["dnsFakeIpFilters"].(string)
 	if !ok || !strings.Contains(filters, "a.w.bilicdn1.com") || strings.Contains(filters, "*.argotunnel.com") {
 		t.Fatalf("dnsFakeIpFilters = %#v, want default fake-ip filters", config.Fields["dnsFakeIpFilters"])
 	}
-	if len(config.DNSServers) != 12 {
-		t.Fatalf("len(DNSServers) = %d, want nameserver and proxy nameserver defaults", len(config.DNSServers))
+	if len(config.DNSServers) != 9 {
+		t.Fatalf("len(DNSServers) = %d, want default and proxy nameserver defaults", len(config.DNSServers))
 	}
 	if config.DNSServers[0].Role != "default" || config.DNSServers[0].Address != "119.29.29.29" {
 		t.Fatalf("DNSServers[0] = %#v, want first default nameserver", config.DNSServers[0])
@@ -120,15 +124,15 @@ func TestGlobalConfigInitializesAndPersistsDefaultDNS(t *testing.T) {
 	if config.DNSServers[2].Protocol != "tls" || config.DNSServers[2].Port != "853" {
 		t.Fatalf("DNSServers[2] = %#v, want parsed TLS nameserver", config.DNSServers[2])
 	}
-	if config.DNSServers[6].Role != "proxy" || config.DNSServers[6].Address != "119.29.29.29" {
-		t.Fatalf("DNSServers[6] = %#v, want proxy-server-nameserver defaults", config.DNSServers[6])
+	if config.DNSServers[6].Role != "proxy" || config.DNSServers[6].Protocol != "https" || config.DNSServers[6].Address != "1.1.1.1" || config.DNSServers[6].Path != "/dns-query" {
+		t.Fatalf("DNSServers[6] = %#v, want proxy DoH nameserver defaults", config.DNSServers[6])
 	}
 
 	var persisted GlobalConfig
 	if err := store.readRepositoryResource(configResourceKind, globalConfigResourceID, &persisted); err != nil {
 		t.Fatalf("read persisted global config error = %v", err)
 	}
-	if persisted.Fields["dnsListen"] != "0.0.0.0:7874" || len(persisted.DNSServers) != 12 || len(persisted.Inbounds) != 6 {
+	if persisted.Fields["dnsListen"] != "0.0.0.0:7874" || len(persisted.DNSServers) != 9 || len(persisted.Inbounds) != 6 {
 		t.Fatalf("persisted config = %#v, want saved default DNS config", persisted)
 	}
 }
@@ -146,7 +150,7 @@ func TestGlobalConfigBackfillsPersistedEmptyConfigWithDefaultDNS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GlobalConfig() error = %v", err)
 	}
-	if config.Fields["dnsListen"] != "0.0.0.0:7874" || len(config.DNSServers) != 12 || len(config.Inbounds) != 6 {
+	if config.Fields["dnsListen"] != "0.0.0.0:7874" || len(config.DNSServers) != 9 || len(config.Inbounds) != 6 {
 		t.Fatalf("config = %#v, want backfilled default DNS config", config)
 	}
 
@@ -154,7 +158,7 @@ func TestGlobalConfigBackfillsPersistedEmptyConfigWithDefaultDNS(t *testing.T) {
 	if err := store.readRepositoryResource(configResourceKind, globalConfigResourceID, &persisted); err != nil {
 		t.Fatalf("read persisted global config error = %v", err)
 	}
-	if persisted.Fields["dnsListen"] != "0.0.0.0:7874" || len(persisted.DNSServers) != 12 || len(persisted.Inbounds) != 6 {
+	if persisted.Fields["dnsListen"] != "0.0.0.0:7874" || len(persisted.DNSServers) != 9 || len(persisted.Inbounds) != 6 {
 		t.Fatalf("persisted config = %#v, want saved backfilled default DNS config", persisted)
 	}
 }
@@ -204,6 +208,55 @@ func TestGlobalConfigBackfillsMissingDefaultsWithoutOverwritingSavedValues(t *te
 	}
 	if len(config.Inbounds) != 1 || config.Inbounds[0].Listen.Port != 7788 {
 		t.Fatalf("Inbounds = %#v, want saved inbounds preserved", config.Inbounds)
+	}
+}
+
+func TestGlobalConfigMigratesLegacyProxyDNSDefaults(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	legacyServers := make([]GlobalDNSServer, 0, len(defaultDNSNameservers)*2)
+	for _, role := range []string{"default", "proxy"} {
+		for index, endpoint := range defaultDNSNameservers {
+			protocol, address, port, path := parseDefaultDNSServerEndpoint(endpoint)
+			legacyServers = append(legacyServers, GlobalDNSServer{
+				ID:       fmt.Sprintf("dns-%s-%d", role, index+1),
+				Name:     fmt.Sprintf("%s-%d", role, index+1),
+				Role:     role,
+				Protocol: protocol,
+				Address:  address,
+				Port:     port,
+				Path:     path,
+			})
+		}
+	}
+	if err := store.writeGlobalConfig(GlobalConfig{
+		Fields:     defaultGlobalConfigFields(),
+		DNSServers: legacyServers,
+		Inbounds:   defaultGlobalInbounds(),
+		UpdatedAt:  time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("write legacy global config error = %v", err)
+	}
+
+	config, err := store.GlobalConfig()
+	if err != nil {
+		t.Fatalf("GlobalConfig() error = %v", err)
+	}
+	if len(config.DNSServers) != 9 {
+		t.Fatalf("len(DNSServers) = %d, want migrated default DNS servers", len(config.DNSServers))
+	}
+	if config.DNSServers[6].Role != "proxy" || config.DNSServers[6].Protocol != "https" || config.DNSServers[6].Address != "1.1.1.1" {
+		t.Fatalf("DNSServers[6] = %#v, want migrated proxy DoH server", config.DNSServers[6])
+	}
+
+	var persisted GlobalConfig
+	if err := store.readRepositoryResource(configResourceKind, globalConfigResourceID, &persisted); err != nil {
+		t.Fatalf("read persisted global config error = %v", err)
+	}
+	if len(persisted.DNSServers) != 9 || persisted.DNSServers[6].Address != "1.1.1.1" {
+		t.Fatalf("persisted DNSServers = %#v, want migrated proxy DNS persisted", persisted.DNSServers)
 	}
 }
 
@@ -541,7 +594,7 @@ func TestOperationEventsAreQueryableAndContextIsSafe(t *testing.T) {
 	}
 }
 
-func TestStorePersistsResourcesAndState(t *testing.T) {
+func TestStorePersistsResourcesAndGlobalConfig(t *testing.T) {
 	root := t.TempDir()
 
 	store, err := NewStore(root)
@@ -589,12 +642,14 @@ func TestStorePersistsResourcesAndState(t *testing.T) {
 		t.Fatalf("CreateProfile() error = %v", err)
 	}
 
-	state, err := store.SetActiveProfile(profile.ID)
+	config, err := store.GlobalConfig()
 	if err != nil {
-		t.Fatalf("SetActiveProfile() error = %v", err)
+		t.Fatalf("GlobalConfig() error = %v", err)
 	}
-	if state.ActiveProfileID != profile.ID {
-		t.Fatalf("ActiveProfileID = %q, want %q", state.ActiveProfileID, profile.ID)
+	config.Fields["selectedCore"] = string(CoreSingBox)
+	config.Fields["routingRuleSetIds"] = []string{"selected-rules"}
+	if _, err := store.UpdateGlobalConfig(config); err != nil {
+		t.Fatalf("UpdateGlobalConfig() error = %v", err)
 	}
 
 	reloaded, err := NewStore(root)
@@ -624,11 +679,15 @@ func TestStorePersistsResourcesAndState(t *testing.T) {
 	if bootstrap.Profiles[0].ID != profile.ID || bootstrap.Profiles[0].Name != "Daily" {
 		t.Fatalf("bootstrap.Profiles[0] = %#v, want reloaded sqlite profile", bootstrap.Profiles[0])
 	}
-	if bootstrap.State.ActiveProfileID != profile.ID {
-		t.Fatalf("bootstrap.State.ActiveProfileID = %q, want %q", bootstrap.State.ActiveProfileID, profile.ID)
-	}
-	if bootstrap.Config.Fields["dnsListen"] != "0.0.0.0:7874" || len(bootstrap.Config.DNSServers) != 12 {
+	if bootstrap.Config.Fields["dnsListen"] != "0.0.0.0:7874" || len(bootstrap.Config.DNSServers) != 9 {
 		t.Fatalf("bootstrap.Config = %#v, want default DNS global config", bootstrap.Config)
+	}
+	if bootstrap.Config.Fields["selectedCore"] != string(CoreSingBox) {
+		t.Fatalf("bootstrap.Config.Fields[selectedCore] = %#v, want %q", bootstrap.Config.Fields["selectedCore"], CoreSingBox)
+	}
+	ruleSetIDs, ok := bootstrap.Config.Fields["routingRuleSetIds"].([]any)
+	if !ok || len(ruleSetIDs) != 1 || ruleSetIDs[0] != "selected-rules" {
+		t.Fatalf("bootstrap.Config.Fields[routingRuleSetIds] = %#v, want selected-rules", bootstrap.Config.Fields["routingRuleSetIds"])
 	}
 	if _, err := os.Stat(filepath.Join(root, "repository", "profiles")); !os.IsNotExist(err) {
 		t.Fatalf("profile JSON directory should not be created, stat error = %v", err)
@@ -656,7 +715,6 @@ func TestStorePersistsResourcesAndState(t *testing.T) {
 	for kind, want := range map[string]int{
 		string(KindSubscription): 1,
 		string(KindNodeSet):      1,
-		stateResourceKind:        1,
 		configResourceKind:       1,
 	} {
 		var count int
@@ -710,41 +768,6 @@ func TestUpdateSubscriptionClearsPreviousSyncErrorAfterSuccessfulSync(t *testing
 
 	if updated.Sync.LastSyncError != "" {
 		t.Fatalf("updated.Sync.LastSyncError = %q, want empty", updated.Sync.LastSyncError)
-	}
-}
-
-func TestStateRecreatedWhenDeleted(t *testing.T) {
-	root := t.TempDir()
-
-	store, err := NewStore(root)
-	if err != nil {
-		t.Fatalf("NewStore() error = %v", err)
-	}
-
-	if _, err := store.db.Exec(`
-		DELETE FROM repository_resources
-		WHERE resource_kind = ? AND resource_id = ?
-	`, stateResourceKind, activeStateResourceID); err != nil {
-		t.Fatalf("delete state resource error = %v", err)
-	}
-
-	state, err := store.State()
-	if err != nil {
-		t.Fatalf("State() after deleting state resource error = %v", err)
-	}
-	if state.UpdatedAt.IsZero() {
-		t.Fatalf("state.UpdatedAt should be set after recreating state resource")
-	}
-	var count int
-	if err := store.db.QueryRow(`
-		SELECT COUNT(*)
-		FROM repository_resources
-		WHERE resource_kind = ? AND resource_id = ?
-	`, stateResourceKind, activeStateResourceID).Scan(&count); err != nil {
-		t.Fatalf("query recreated state resource error = %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("state resource count = %d, want 1", count)
 	}
 }
 

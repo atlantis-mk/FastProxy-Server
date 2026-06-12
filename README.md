@@ -69,6 +69,22 @@ GITHUB_TOKEN
 
 `FASTPROXY_SERVER_MIHOMO_BIN` 和 `FASTPROXY_SERVER_SING_BOX_BIN` 始终是最高优先级二进制来源。未设置时，后端会扫描本地 `cores/` 缓存；GitHub 下载只会在显式检查或安装更新时发生。
 
+## 打包内置前端
+
+参考 Mibo 的打包方式，FastProxy 可以先构建 Vite 前端，再复制到后端的 `internal/webui/dist/`，最后通过 Go `embed.FS` 打进同一个后端二进制：
+
+```bash
+pnpm build:binary
+```
+
+默认输出到仓库根目录的 `build/fastproxy-server`。如需自定义输出路径：
+
+```bash
+FASTPROXY_OUTPUT=/tmp/fastproxy-server pnpm build:binary
+```
+
+运行该二进制后，`/api/*` 仍由后端 API 处理，其它路径由内置前端资源响应，并支持前端路由刷新回退到 `index.html`。
+
 ## macOS 安装为系统服务
 
 打包后的后端二进制可以命名为 `fastproxy`，并用 root 权限安装为 LaunchDaemon：

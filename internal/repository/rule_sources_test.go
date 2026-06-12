@@ -368,6 +368,39 @@ func TestRuleSourceRepositoryBrowserRefreshIndexMergesSingAndMetaBranches(t *tes
 	}
 }
 
+func TestRuleSourceRepositoryBrowserRefreshIndexUsesGitHubToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("Authorization = %q, want Bearer test-token", got)
+		}
+		if r.URL.Path != "/repos/example/rules/git/trees/main" {
+			t.Fatalf("path = %q, want /repos/example/rules/git/trees/main", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"tree":[]}`))
+	}))
+	defer server.Close()
+
+	browser := NewRuleSourceRepositoryBrowser()
+	browser.client = server.Client()
+	browser.githubAPIBase = server.URL
+	browser.SetGitHubTokenProvider(func() string {
+		return " test-token "
+	})
+
+	_, err := browser.RefreshIndex(RuleSourceRepository{
+		Metadata:   Metadata{ID: "custom"},
+		Provider:   RuleSourceRepositoryProviderGitHub,
+		Owner:      "example",
+		Repository: "rules",
+		CoreMappings: []RuleSourceCoreMapping{
+			{Core: CoreSingBox, Ref: "main"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("RefreshIndex() error = %v", err)
+	}
+}
+
 func TestStorePersistsRuleSourceIndexAndReturnsEmptyBuiltInIndex(t *testing.T) {
 	root := t.TempDir()
 	store, err := NewStore(root)

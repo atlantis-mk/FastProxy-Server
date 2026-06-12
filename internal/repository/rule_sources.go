@@ -298,8 +298,9 @@ func findRuleSourceCoreMapping(repo RuleSourceRepository, core Core) (RuleSource
 }
 
 type RuleSourceRepositoryBrowser struct {
-	client        *http.Client
-	githubAPIBase string
+	client              *http.Client
+	githubAPIBase       string
+	githubTokenProvider func() string
 }
 
 func NewRuleSourceRepositoryBrowser() *RuleSourceRepositoryBrowser {
@@ -307,6 +308,10 @@ func NewRuleSourceRepositoryBrowser() *RuleSourceRepositoryBrowser {
 		client:        &http.Client{Timeout: 20 * time.Second},
 		githubAPIBase: "https://api.github.com",
 	}
+}
+
+func (b *RuleSourceRepositoryBrowser) SetGitHubTokenProvider(provider func() string) {
+	b.githubTokenProvider = provider
 }
 
 func (b *RuleSourceRepositoryBrowser) Browse(repo RuleSourceRepository, core Core, requestedPath string) (RuleSourceTree, error) {
@@ -397,7 +402,7 @@ func (b *RuleSourceRepositoryBrowser) browseGitHub(repo RuleSourceRepository, ma
 	query := req.URL.Query()
 	query.Set("ref", mapping.Ref)
 	req.URL.RawQuery = query.Encode()
-	req.Header.Set("Accept", "application/vnd.github+json")
+	b.setGitHubRequestHeaders(req)
 
 	resp, err := b.client.Do(req)
 	if err != nil {
@@ -601,7 +606,7 @@ func (b *RuleSourceRepositoryBrowser) fetchGitHubTree(repo RuleSourceRepository,
 	if err != nil {
 		return githubTreePayload{}, err
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
+	b.setGitHubRequestHeaders(req)
 
 	resp, err := b.client.Do(req)
 	if err != nil {
@@ -621,6 +626,16 @@ func (b *RuleSourceRepositoryBrowser) fetchGitHubTree(repo RuleSourceRepository,
 		return githubTreePayload{}, err
 	}
 	return payload, nil
+}
+
+func (b *RuleSourceRepositoryBrowser) setGitHubRequestHeaders(req *http.Request) {
+	req.Header.Set("Accept", "application/vnd.github+json")
+	if b.githubTokenProvider == nil {
+		return
+	}
+	if token := strings.TrimSpace(b.githubTokenProvider()); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 }
 
 type selectableFileCandidate struct {

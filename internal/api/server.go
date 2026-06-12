@@ -18,6 +18,7 @@ import (
 	"github.com/atlantis-mk/FastProxy-Server/internal/importer"
 	"github.com/atlantis-mk/FastProxy-Server/internal/repository"
 	"github.com/atlantis-mk/FastProxy-Server/internal/subsync"
+	"github.com/atlantis-mk/FastProxy-Server/internal/webui"
 )
 
 type Server struct {
@@ -45,6 +46,7 @@ func NewServer(cfg appconfig.Config, logger *slog.Logger, store *repository.Stor
 		mux:      http.NewServeMux(),
 	}
 	core.SetGitHubTokenProvider(server.settings.GitHubToken)
+	server.browser.SetGitHubTokenProvider(server.githubToken)
 	server.routes()
 	return server
 }
@@ -101,9 +103,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/cores/{core}/check-update", s.handleCoreCheckUpdate)
 	s.mux.HandleFunc("POST /api/cores/{core}/update", s.handleCoreUpdate)
 	s.mux.HandleFunc("POST /api/cores/{core}/upload", s.handleCoreUpload)
-	s.mux.HandleFunc("PUT /api/repository/profiles/active/core", s.handleSelectProfileCore)
 	s.mux.HandleFunc("GET /api/runtime/status", s.handleRuntimeStatus)
-	s.mux.HandleFunc("PUT /api/runtime/core", s.handleSelectProfileCore)
+	s.mux.HandleFunc("PUT /api/runtime/core", s.handleSelectRuntimeCore)
 	s.mux.HandleFunc("POST /api/runtime/start", s.handleRuntimeStart)
 	s.mux.HandleFunc("POST /api/runtime/stop", s.handleRuntimeStop)
 	s.mux.HandleFunc("POST /api/runtime/restart", s.handleRuntimeRestart)
@@ -116,8 +117,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/profiles/{id}", s.handleGetProfile)
 	s.mux.HandleFunc("PUT /api/profiles/{id}", s.handleUpdateProfile)
 	s.mux.HandleFunc("DELETE /api/profiles/{id}", s.handleDeleteProfile)
-	s.mux.HandleFunc("GET /api/profile-state", s.handleProfileState)
-	s.mux.HandleFunc("PUT /api/profile-state/active", s.handleSetActiveProfile)
 	s.mux.HandleFunc("GET /api/repository/subscriptions", s.handleListSubscriptions)
 	s.mux.HandleFunc("POST /api/repository/subscriptions", s.handleCreateSubscription)
 	s.mux.HandleFunc("GET /api/repository/subscriptions/{id}", s.handleGetSubscription)
@@ -165,8 +164,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/repository/group-sets/{id}", s.handleGetGroupSet)
 	s.mux.HandleFunc("PUT /api/repository/group-sets/{id}", s.handleUpdateGroupSet)
 	s.mux.HandleFunc("DELETE /api/repository/group-sets/{id}", s.handleDeleteGroupSet)
-	s.mux.HandleFunc("GET /api/repository/state", s.handleProfileState)
-	s.mux.HandleFunc("PUT /api/repository/profiles/active", s.handleSetActiveProfile)
 	s.mux.HandleFunc("GET /api/repository/config", s.handleGetGlobalConfig)
 	s.mux.HandleFunc("PUT /api/repository/config", s.handleUpdateGlobalConfig)
 	s.mux.HandleFunc("GET /api/repository/config/inbounds", s.handleGetGlobalInbounds)
@@ -175,6 +172,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/repository/imports/plain-nodes", s.handleImportPlainNodes)
 	s.mux.HandleFunc("POST /api/repository/imports/manual-node", s.handleImportManualNode)
 	s.mux.HandleFunc("DELETE /api/repository/imports/manual-node", s.handleDeleteManualNode)
+	s.mux.Handle("/", newWebAppHandler(webui.EmbeddedDist()))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -185,14 +183,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleBootstrap(w http.ResponseWriter, r *http.Request) {
-	state, err := s.store.State()
-	if err != nil {
-		httpjson.WriteError(w, http.StatusInternalServerError, "profile_state_read_failed", err.Error())
-		return
-	}
 	httpjson.Write(w, http.StatusOK, map[string]any{
-		"dataDir":      s.cfg.DataDir,
-		"profileState": state,
+		"dataDir": s.cfg.DataDir,
 	})
 }
 
@@ -230,6 +222,13 @@ func (s *Server) githubTokenSetting() githubTokenSetting {
 		return githubTokenSetting{Configured: true, Source: "environment"}
 	}
 	return githubTokenSetting{}
+}
+
+func (s *Server) githubToken() string {
+	if token := strings.TrimSpace(s.settings.GitHubToken()); token != "" {
+		return token
+	}
+	return strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
 }
 
 func (s *Server) handleCoreInventory(w http.ResponseWriter, r *http.Request) {
@@ -350,35 +349,33 @@ func (s *Server) handleQueryOperationEvents(w http.ResponseWriter, r *http.Reque
 	httpjson.Write(w, http.StatusOK, page)
 }
 
-func (s *Server) handleSelectProfileCore(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSelectRuntimeCore(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Core repository.Core `json:"core"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		httpjson.WriteError(w, http.StatusBadRequest, "invalid_profile_core", "request body must be valid JSON")
-		return
-	}
-	state, stateErr := s.store.State()
-	if stateErr != nil {
-		httpjson.WriteError(w, http.StatusInternalServerError, "profile_state_read_failed", stateErr.Error())
-		return
-	}
-	if state.ActiveProfileID == "" {
-		httpjson.WriteError(w, http.StatusNotFound, "active_profile_not_found", repository.ErrNotFound.Error())
+		httpjson.WriteError(w, http.StatusBadRequest, "invalid_runtime_core", "request body must be valid JSON")
 		return
 	}
 	if err := core.ValidateCore(input.Core); err != nil {
 		httpjson.WriteError(w, http.StatusBadRequest, "unsupported_core", err.Error())
 		return
 	}
-	profile, err := s.store.GetProfile(state.ActiveProfileID)
+	config, err := s.store.GlobalConfig()
 	if err != nil {
-		s.writeRepositoryResponse(w, profile, err, "profile")
+		httpjson.WriteError(w, http.StatusInternalServerError, "global_config_read_failed", err.Error())
 		return
 	}
-	profile.SelectedCore = input.Core
-	updated, err := s.store.UpdateProfile(profile.ID, profile)
-	s.writeRepositoryMutation(w, updated, err, "profile_core_update_failed", "profile")
+	if config.Fields == nil {
+		config.Fields = map[string]any{}
+	}
+	config.Fields["selectedCore"] = string(input.Core)
+	updated, err := s.store.UpdateGlobalConfig(config)
+	if err != nil {
+		httpjson.WriteError(w, http.StatusInternalServerError, "runtime_core_update_failed", err.Error())
+		return
+	}
+	httpjson.Write(w, http.StatusOK, updated)
 }
 
 func (s *Server) handleListProfiles(w http.ResponseWriter, r *http.Request) {
@@ -451,37 +448,6 @@ func (s *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) handleProfileState(w http.ResponseWriter, r *http.Request) {
-	state, err := s.store.State()
-	if err != nil {
-		httpjson.WriteError(w, http.StatusInternalServerError, "profile_state_read_failed", err.Error())
-		return
-	}
-	httpjson.Write(w, http.StatusOK, state)
-}
-
-func (s *Server) handleSetActiveProfile(w http.ResponseWriter, r *http.Request) {
-	var input struct {
-		ProfileID string `json:"profileId"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		httpjson.WriteError(w, http.StatusBadRequest, "invalid_profile_state", "request body must be valid JSON")
-		return
-	}
-	state, err := s.store.SetActiveProfile(input.ProfileID)
-	if err != nil {
-		status := http.StatusInternalServerError
-		code := "profile_state_save_failed"
-		if errors.Is(err, repository.ErrNotFound) {
-			status = http.StatusNotFound
-			code = "profile_not_found"
-		}
-		httpjson.WriteError(w, status, code, err.Error())
-		return
-	}
-	httpjson.Write(w, http.StatusOK, state)
 }
 
 func (s *Server) handleGetGlobalInbounds(w http.ResponseWriter, r *http.Request) {

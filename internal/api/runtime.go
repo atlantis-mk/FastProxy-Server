@@ -25,15 +25,15 @@ import (
 
 const defaultExternalController = "127.0.0.1:9090"
 const singBoxFakeIPServerTag = "fakeip"
-const singBoxBuiltInGeoIPRepositoryID = "metacubex-meta-rules-dat"
+const singBoxBuiltInRuleRepositoryID = "metacubex-meta-rules-dat"
 
 func (s *Server) handleRuntimeStatus(w http.ResponseWriter, r *http.Request) {
 	status := s.sv.Status()
-	active, err := s.activeRuntimeProfile()
-	if err == nil && status.Core != "" && active.SelectedCore != status.Core {
+	selection, err := s.runtimeSelection()
+	if err == nil && status.Core != "" && selection.SelectedCore != status.Core {
 		httpjson.Write(w, http.StatusOK, map[string]any{
 			"core":           status.Core,
-			"selectedCore":   active.SelectedCore,
+			"selectedCore":   selection.SelectedCore,
 			"state":          status.State,
 			"startedAt":      status.StartedAt,
 			"error":          status.Error,
@@ -109,19 +109,19 @@ func (s *Server) handleRuntimeControllerProxy(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) startActiveRuntime(ctx context.Context) error {
-	active, err := s.activeRuntimeProfile()
+	selection, err := s.runtimeSelection()
 	if err != nil {
 		return err
 	}
-	adapter, err := core.For(active.SelectedCore)
+	adapter, err := core.For(selection.SelectedCore)
 	if err != nil {
 		return err
 	}
-	binaryPath, err := s.binaryFor(ctx, active.SelectedCore)
+	binaryPath, err := s.binaryFor(ctx, selection.SelectedCore)
 	if err != nil {
 		return err
 	}
-	compiled, err := s.compileRuntime(ctx, active, binaryPath)
+	compiled, err := s.compileRuntime(ctx, selection, binaryPath)
 	if err != nil {
 		return err
 	}
@@ -141,15 +141,24 @@ func (s *Server) startActiveRuntime(ctx context.Context) error {
 	})
 }
 
-func (s *Server) activeRuntimeProfile() (repository.ProfileResource, error) {
-	state, err := s.store.State()
+type runtimeSelection struct {
+	SelectedCore repository.Core
+	RuleSetIDs   []string
+}
+
+func (s *Server) runtimeSelection() (runtimeSelection, error) {
+	config, err := s.store.GlobalConfig()
 	if err != nil {
-		return repository.ProfileResource{}, err
+		return runtimeSelection{}, err
 	}
-	if state.ActiveProfileID == "" {
-		return repository.ProfileResource{}, repository.ErrNotFound
+	selectedCore := repository.Core(stringField(config.Fields, "selectedCore", string(repository.CoreMihomo)))
+	if err := core.ValidateCore(selectedCore); err != nil {
+		return runtimeSelection{}, err
 	}
-	return s.store.GetProfile(state.ActiveProfileID)
+	return runtimeSelection{
+		SelectedCore: selectedCore,
+		RuleSetIDs:   stringValues(config.Fields["routingRuleSetIds"]),
+	}, nil
 }
 
 func (s *Server) binaryFor(ctx context.Context, coreName repository.Core) (string, error) {
@@ -167,42 +176,39 @@ type compiledRuntime struct {
 }
 
 type runtimeCompileOptions struct {
-	SingBoxDNS14 bool
+	SingBoxDNS14   bool
+	ProxyDNSDetour string
+	RuleSetDetour  string
 }
 
-func (s *Server) compileRuntime(ctx context.Context, active repository.ProfileResource, binaryPath string) (compiledRuntime, error) {
+func (s *Server) compileRuntime(ctx context.Context, selection runtimeSelection, binaryPath string) (compiledRuntime, error) {
 	bootstrap, err := s.store.Bootstrap()
 	if err != nil {
 		return compiledRuntime{}, err
 	}
-	nodes := selectedNodes(active, bootstrap.NodeSets)
-	groups := selectedGroups(active, bootstrap.GroupSets)
-	rules := selectedRules(active, bootstrap.RoutingRuleSets)
-	if len(active.RuleSetIDs) > 0 {
-		if len(active.NodeSetIDs) == 0 {
-			nodes = relatedNodes(active, bootstrap.NodeSets, bootstrap.RoutingRuleSets)
-		}
-		if len(active.GroupSetIDs) == 0 {
-			groups = relatedGroups(active, bootstrap.GroupSets, bootstrap.RoutingRuleSets)
-		}
-	}
+	groups := selectedGroups(selection.RuleSetIDs, bootstrap.RoutingRuleSets, bootstrap.GroupSets)
+	rules := selectedRules(selection.RuleSetIDs, bootstrap.RoutingRuleSets)
+	nodes := selectedNodes(selection.RuleSetIDs, bootstrap.RoutingRuleSets, bootstrap.NodeSets, groups, rules)
 	externalController := stringField(bootstrap.Config.Fields, "externalController", defaultExternalController)
 	if strings.TrimSpace(externalController) == "" {
 		externalController = defaultExternalController
 	}
 	secret := stringField(bootstrap.Config.Fields, "secret", "")
 
-	switch active.SelectedCore {
+	switch selection.SelectedCore {
 	case repository.CoreMihomo:
-		data, err := marshalMihomoRuntimeConfig(mihomoRuntimeConfig(bootstrap.Config, nodes, groups, rules, externalController))
+		data, err := marshalMihomoRuntimeConfig(mihomoRuntimeConfig(bootstrap.Config, nodes, groups, rules, bootstrap.MihomoRuleProviders, bootstrap.RuleSourceRepositories, externalController))
 		return compiledRuntime{Data: data, ExternalController: externalController, Secret: secret}, err
 	case repository.CoreSingBox:
+		runtimeDetour := singBoxRuleSetDownloadDetour(nodes, groups, rules)
 		data, err := json.MarshalIndent(singBoxRuntimeConfig(bootstrap.Config, nodes, groups, rules, bootstrap.SingBoxRuleSets, bootstrap.RuleSourceRepositories, externalController, runtimeCompileOptions{
-			SingBoxDNS14: singBoxSupportsDNS14(ctx, binaryPath),
+			SingBoxDNS14:   singBoxSupportsDNS14(ctx, binaryPath),
+			ProxyDNSDetour: runtimeDetour,
+			RuleSetDetour:  runtimeDetour,
 		}), "", "  ")
 		return compiledRuntime{Data: data, ExternalController: externalController, Secret: secret}, err
 	default:
-		return compiledRuntime{}, fmt.Errorf("unsupported core %q", active.SelectedCore)
+		return compiledRuntime{}, fmt.Errorf("unsupported core %q", selection.SelectedCore)
 	}
 }
 
@@ -300,37 +306,74 @@ func singleJoiningSlash(left string, right string) string {
 	}
 }
 
-func selectedNodes(active repository.ProfileResource, nodeSets []repository.NodeSetResource) []repository.NormalizedNode {
-	selected := map[string]bool{}
-	for _, id := range active.NodeSetIDs {
-		selected[id] = true
-	}
+func allNodes(nodeSets []repository.NodeSetResource) []repository.NormalizedNode {
 	var nodes []repository.NormalizedNode
 	for _, set := range nodeSets {
-		if selected[set.ID] {
-			nodes = append(nodes, set.Nodes...)
-		}
+		nodes = append(nodes, set.Nodes...)
 	}
 	return nodes
 }
 
-func selectedGroups(active repository.ProfileResource, groupSets []repository.GroupSetResource) []repository.NormalizedGroup {
-	selected := map[string]bool{}
-	for _, id := range active.GroupSetIDs {
-		selected[id] = true
+func selectedNodes(ruleSetIDs []string, ruleSets []repository.RuleSetResource, nodeSets []repository.NodeSetResource, groups []repository.NormalizedGroup, rules []repository.NormalizedRule) []repository.NormalizedNode {
+	if len(ruleSetIDs) == 0 {
+		return uniqueNodesByTag(allNodes(nodeSets))
 	}
+	selectedNames := selectedRuleSetNames(ruleSetIDs, ruleSets)
+	var nodes []repository.NormalizedNode
+	for _, set := range nodeSets {
+		if selectedNames[set.ID] || selectedNames[set.Name] {
+			nodes = append(nodes, set.Nodes...)
+		}
+	}
+	if len(nodes) == 0 {
+		return uniqueNodesByTag(allNodes(nodeSets))
+	}
+	return uniqueNodesByTag(append(nodes, referencedNodes(allNodes(nodeSets), groups, rules)...))
+}
+
+func allGroups(groupSets []repository.GroupSetResource) []repository.NormalizedGroup {
 	var groups []repository.NormalizedGroup
 	for _, set := range groupSets {
-		if selected[set.ID] {
-			groups = append(groups, set.Groups...)
-		}
+		groups = append(groups, set.Groups...)
 	}
 	return groups
 }
 
-func selectedRules(active repository.ProfileResource, ruleSets []repository.RuleSetResource) []repository.NormalizedRule {
+func selectedGroups(ruleSetIDs []string, ruleSets []repository.RuleSetResource, groupSets []repository.GroupSetResource) []repository.NormalizedGroup {
+	if len(ruleSetIDs) == 0 {
+		return uniqueGroupsByTag(allGroups(groupSets))
+	}
+	selectedNames := selectedRuleSetNames(ruleSetIDs, ruleSets)
+	var groups []repository.NormalizedGroup
+	for _, set := range groupSets {
+		if selectedNames[set.ID] || selectedNames[set.Name] {
+			groups = append(groups, set.Groups...)
+		}
+	}
+	if len(groups) == 0 {
+		return uniqueGroupsByTag(allGroups(groupSets))
+	}
+	return uniqueGroupsByTag(groups)
+}
+
+func selectedRuleSetNames(ruleSetIDs []string, ruleSets []repository.RuleSetResource) map[string]bool {
 	selected := map[string]bool{}
-	for _, id := range active.RuleSetIDs {
+	for _, id := range ruleSetIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			selected[id] = true
+		}
+	}
+	for _, set := range ruleSets {
+		if selected[set.ID] {
+			selected[set.Name] = true
+		}
+	}
+	return selected
+}
+
+func selectedRules(ruleSetIDs []string, ruleSets []repository.RuleSetResource) []repository.NormalizedRule {
+	selected := map[string]bool{}
+	for _, id := range ruleSetIDs {
 		selected[id] = true
 	}
 	var rules []repository.NormalizedRule
@@ -342,39 +385,99 @@ func selectedRules(active repository.ProfileResource, ruleSets []repository.Rule
 	return rules
 }
 
-func relatedNodes(active repository.ProfileResource, nodeSets []repository.NodeSetResource, ruleSets []repository.RuleSetResource) []repository.NormalizedNode {
-	names := relatedRuleSetNames(active, ruleSets)
-	var nodes []repository.NormalizedNode
-	for _, set := range nodeSets {
-		if names[set.ID] || names[set.Name] {
-			nodes = append(nodes, set.Nodes...)
-		}
+func referencedNodes(nodes []repository.NormalizedNode, groups []repository.NormalizedGroup, rules []repository.NormalizedRule) []repository.NormalizedNode {
+	references := referencedOutboundTags(groups, rules)
+	if len(references) == 0 {
+		return nil
 	}
-	return nodes
-}
-
-func relatedGroups(active repository.ProfileResource, groupSets []repository.GroupSetResource, ruleSets []repository.RuleSetResource) []repository.NormalizedGroup {
-	names := relatedRuleSetNames(active, ruleSets)
-	var groups []repository.NormalizedGroup
-	for _, set := range groupSets {
-		if names[set.ID] || names[set.Name] {
-			groups = append(groups, set.Groups...)
-		}
-	}
-	return groups
-}
-
-func relatedRuleSetNames(active repository.ProfileResource, ruleSets []repository.RuleSetResource) map[string]bool {
-	selected := map[string]bool{}
-	for _, id := range active.RuleSetIDs {
-		selected[id] = true
-	}
-	for _, set := range ruleSets {
-		if selected[set.ID] {
-			selected[set.Name] = true
+	var selected []repository.NormalizedNode
+	for _, node := range nodes {
+		if references[strings.TrimSpace(node.Tag)] {
+			selected = append(selected, node)
 		}
 	}
 	return selected
+}
+
+func referencedOutboundTags(groups []repository.NormalizedGroup, rules []repository.NormalizedRule) map[string]bool {
+	references := map[string]bool{}
+	for _, group := range groups {
+		for _, outbound := range group.Outbounds {
+			addOutboundReference(references, outbound)
+		}
+	}
+	for _, rule := range rules {
+		addRuleOutboundReferences(references, rule)
+	}
+	return references
+}
+
+func addRuleOutboundReferences(references map[string]bool, rule repository.NormalizedRule) {
+	addOutboundReference(references, rule.Outbound)
+	for _, raw := range rule.Raw {
+		if target := mihomoRawRuleTarget(raw); target != "" {
+			addOutboundReference(references, target)
+		}
+	}
+	for _, child := range rule.Rules {
+		addRuleOutboundReferences(references, child)
+	}
+}
+
+func addOutboundReference(references map[string]bool, value string) {
+	tag := strings.TrimSpace(value)
+	if tag == "" {
+		return
+	}
+	switch strings.ToUpper(tag) {
+	case "DIRECT", "REJECT", "REJECT-DROP", "BLOCK", "GLOBAL":
+		return
+	default:
+		references[tag] = true
+	}
+}
+
+func mihomoRawRuleTarget(line string) string {
+	parts := trimNonEmptyCommaParts(line)
+	if len(parts) == 0 {
+		return ""
+	}
+	ruleType := strings.ToUpper(parts[0])
+	if ruleType == "MATCH" && len(parts) >= 2 {
+		return parts[1]
+	}
+	if len(parts) >= 3 {
+		return parts[2]
+	}
+	return ""
+}
+
+func uniqueNodesByTag(nodes []repository.NormalizedNode) []repository.NormalizedNode {
+	seen := map[string]bool{}
+	unique := make([]repository.NormalizedNode, 0, len(nodes))
+	for _, node := range nodes {
+		tag := strings.TrimSpace(node.Tag)
+		if tag == "" || seen[tag] {
+			continue
+		}
+		seen[tag] = true
+		unique = append(unique, node)
+	}
+	return unique
+}
+
+func uniqueGroupsByTag(groups []repository.NormalizedGroup) []repository.NormalizedGroup {
+	seen := map[string]bool{}
+	unique := make([]repository.NormalizedGroup, 0, len(groups))
+	for _, group := range groups {
+		tag := strings.TrimSpace(group.Tag)
+		if tag == "" || seen[tag] {
+			continue
+		}
+		seen[tag] = true
+		unique = append(unique, group)
+	}
+	return unique
 }
 
 func marshalMihomoRuntimeConfig(config map[string]any) ([]byte, error) {
@@ -408,7 +511,7 @@ func marshalMihomoRuntimeConfig(config map[string]any) ([]byte, error) {
 	return yaml.Marshal(node)
 }
 
-func mihomoRuntimeConfig(config repository.GlobalConfig, nodes []repository.NormalizedNode, groups []repository.NormalizedGroup, rules []repository.NormalizedRule, externalController string) map[string]any {
+func mihomoRuntimeConfig(config repository.GlobalConfig, nodes []repository.NormalizedNode, groups []repository.NormalizedGroup, rules []repository.NormalizedRule, ruleProviders []repository.MihomoRuleProviderResource, repositories []repository.RuleSourceRepository, externalController string) map[string]any {
 	fields := config.Fields
 	result := map[string]any{
 		"mode":                stringField(fields, "mode", "rule"),
@@ -425,6 +528,9 @@ func mihomoRuntimeConfig(config repository.GlobalConfig, nodes []repository.Norm
 		"rules":               mihomoRules(rules),
 		"dns":                 mihomoDNS(config),
 		"geox-url":            mihomoGeoxURL(config),
+	}
+	if providers := mihomoRuleProviders(rules, ruleProviders, repositories); len(providers) > 0 {
+		result["rule-providers"] = providers
 	}
 	setStrings(result, "lan-allowed-ips", splitLines(stringField(fields, "lanAllowedIps", "")))
 	setStrings(result, "lan-disallowed-ips", splitLines(stringField(fields, "lanDisallowedIps", "")))
@@ -630,9 +736,9 @@ func singBoxRuntimeConfig(config repository.GlobalConfig, nodes []repository.Nor
 
 	return map[string]any{
 		"log":          map[string]any{"level": stringField(config.Fields, "logLevel", "info")},
-		"inbounds":     singBoxInbounds(config.Inbounds),
+		"inbounds":     singBoxInbounds(config.Inbounds, options),
 		"outbounds":    singBoxOutbounds(nodes, groups),
-		"route":        singBoxRoute(config, rules, ruleSets, repositories),
+		"route":        singBoxRoute(config, rules, ruleSets, repositories, options.RuleSetDetour),
 		"dns":          singBoxDNS(config, options),
 		"experimental": map[string]any{"clash_api": clashAPI},
 	}
@@ -642,8 +748,9 @@ func mihomoProxies(nodes []repository.NormalizedNode) []map[string]any {
 	proxies := make([]map[string]any, 0, len(nodes))
 	for _, node := range nodes {
 		proxy := copyMap(node.Raw)
+		applyMihomoNodeTransport(proxy, node)
 		proxy["name"] = node.Tag
-		proxy["type"] = node.Type
+		proxy["type"] = mihomoProxyType(node.Type)
 		if node.Server != "" {
 			proxy["server"] = node.Server
 		}
@@ -655,13 +762,216 @@ func mihomoProxies(nodes []repository.NormalizedNode) []map[string]any {
 	return proxies
 }
 
+func mihomoProxyType(nodeType string) string {
+	switch nodeType {
+	case "shadowsocks":
+		return "ss"
+	default:
+		return nodeType
+	}
+}
+
+func applyMihomoNodeTransport(proxy map[string]any, node repository.NormalizedNode) {
+	transport := node.Transport
+	switch node.Type {
+	case "shadowsocks":
+		setMihomoValue(proxy, "cipher", transport["method"])
+		setMihomoValue(proxy, "password", transport["password"])
+		setMihomoValue(proxy, "plugin", transport["plugin"])
+		setMihomoValue(proxy, "plugin-opts", transport["plugin_opts"])
+		setMihomoValue(proxy, "udp-over-tcp", transport["udp_over_tcp"])
+	case "vmess":
+		setMihomoValue(proxy, "uuid", transport["uuid"])
+		setMihomoValue(proxy, "alterId", transport["alter_id"])
+		setMihomoValue(proxy, "cipher", transport["security"])
+		setMihomoValue(proxy, "packet-encoding", transport["packet_encoding"])
+		setMihomoValue(proxy, "global-padding", transport["global_padding"])
+		setMihomoValue(proxy, "authenticated-length", transport["authenticated_length"])
+	case "vless":
+		setMihomoValue(proxy, "uuid", transport["uuid"])
+		setMihomoValue(proxy, "flow", transport["flow"])
+		setMihomoValue(proxy, "packet-encoding", transport["packet_encoding"])
+		setMihomoValue(proxy, "encryption", transport["encryption"])
+	case "trojan":
+		setMihomoValue(proxy, "password", transport["password"])
+	case "hysteria":
+		setMihomoValue(proxy, "up", transport["up"])
+		setMihomoValue(proxy, "down", transport["down"])
+		setMihomoMbps(proxy, "up", transport["up_mbps"])
+		setMihomoMbps(proxy, "down", transport["down_mbps"])
+		setMihomoValue(proxy, "obfs", transport["obfs"])
+		setMihomoValue(proxy, "auth", transport["auth"])
+		setMihomoValue(proxy, "auth-str", transport["auth_str"])
+	case "hysteria2":
+		setMihomoValue(proxy, "up", transport["up"])
+		setMihomoValue(proxy, "down", transport["down"])
+		setMihomoMbps(proxy, "up", transport["up_mbps"])
+		setMihomoMbps(proxy, "down", transport["down_mbps"])
+		setMihomoValue(proxy, "password", transport["password"])
+		setMihomoHysteria2Obfs(proxy, transport["obfs"])
+	case "tuic":
+		setMihomoValue(proxy, "uuid", transport["uuid"])
+		setMihomoValue(proxy, "password", transport["password"])
+		setMihomoValue(proxy, "congestion-controller", transport["congestion_control"])
+		setMihomoValue(proxy, "udp-relay-mode", transport["udp_relay_mode"])
+		setMihomoValue(proxy, "udp-over-stream", transport["udp_over_stream"])
+		setMihomoValue(proxy, "reduce-rtt", transport["zero_rtt_handshake"])
+		setMihomoValue(proxy, "heartbeat-interval", transport["heartbeat"])
+	case "wireguard":
+		setMihomoValue(proxy, "ip", transport["local_address"])
+		setMihomoValue(proxy, "private-key", transport["private_key"])
+		setMihomoValue(proxy, "public-key", transport["peer_public_key"])
+		setMihomoValue(proxy, "pre-shared-key", transport["pre_shared_key"])
+		setMihomoValue(proxy, "reserved", transport["reserved"])
+		setMihomoValue(proxy, "mtu", transport["mtu"])
+	}
+	applyMihomoCommonNodeFields(proxy, transport)
+	setMihomoValue(proxy, "network", transport["network"])
+	applyMihomoNodeTLS(proxy, node.Type, transport["tls"])
+}
+
+func applyMihomoCommonNodeFields(proxy map[string]any, transport map[string]any) {
+	setMihomoValue(proxy, "ip-version", transport["mihomo_ip_version"])
+	setMihomoValue(proxy, "udp", transport["udp"])
+	setMihomoValue(proxy, "interface-name", transport["bind_interface"])
+	setMihomoValue(proxy, "routing-mark", transport["routing_mark"])
+	setMihomoValue(proxy, "tfo", transport["tcp_fast_open"])
+	setMihomoValue(proxy, "mptcp", transport["tcp_multi_path"])
+	setMihomoValue(proxy, "dialer-proxy", transport["detour"])
+	setMihomoValue(proxy, "smux", mihomoSmuxFromMultiplex(transport["multiplex"]))
+}
+
+func mihomoSmuxFromMultiplex(value any) map[string]any {
+	multiplex, ok := value.(map[string]any)
+	if !ok || len(multiplex) == 0 {
+		return nil
+	}
+	smux := map[string]any{}
+	setMihomoValue(smux, "enabled", multiplex["enabled"])
+	setMihomoValue(smux, "protocol", multiplex["protocol"])
+	setMihomoValue(smux, "max-connections", multiplex["max_connections"])
+	setMihomoValue(smux, "min-streams", multiplex["min_streams"])
+	setMihomoValue(smux, "max-streams", multiplex["max_streams"])
+	setMihomoValue(smux, "padding", multiplex["padding"])
+	setMihomoValue(smux, "brutal-opts", mihomoSmuxBrutalFromMultiplex(multiplex["brutal"]))
+	if len(smux) == 0 {
+		return nil
+	}
+	return smux
+}
+
+func mihomoSmuxBrutalFromMultiplex(value any) map[string]any {
+	brutal, ok := value.(map[string]any)
+	if !ok || len(brutal) == 0 {
+		return nil
+	}
+	opts := map[string]any{}
+	setMihomoValue(opts, "enabled", brutal["enabled"])
+	setMihomoValue(opts, "up", brutal["up_mbps"])
+	setMihomoValue(opts, "down", brutal["down_mbps"])
+	if len(opts) == 0 {
+		return nil
+	}
+	return opts
+}
+
+func applyMihomoNodeTLS(proxy map[string]any, nodeType string, value any) {
+	tls, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	if enabled, ok := tls["enabled"].(bool); ok {
+		proxy["tls"] = enabled
+	}
+	if nodeType == "trojan" {
+		proxy["tls"] = true
+	}
+	setMihomoValue(proxy, "servername", tls["server_name"])
+	setMihomoValue(proxy, "sni", tls["server_name"])
+	setMihomoValue(proxy, "skip-cert-verify", tls["insecure"])
+	if utls, ok := tls["utls"].(map[string]any); ok {
+		setMihomoValue(proxy, "client-fingerprint", utls["fingerprint"])
+	}
+	if reality, ok := tls["reality"].(map[string]any); ok {
+		realityOpts := map[string]any{}
+		setMihomoValue(realityOpts, "public-key", reality["public_key"])
+		setMihomoValue(realityOpts, "short-id", reality["short_id"])
+		if len(realityOpts) > 0 {
+			proxy["reality-opts"] = realityOpts
+			proxy["tls"] = true
+		}
+	}
+}
+
+func setMihomoValue(target map[string]any, key string, value any) {
+	switch typed := value.(type) {
+	case nil:
+		return
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return
+		}
+	case []string:
+		if len(typed) == 0 {
+			return
+		}
+	case []any:
+		if len(typed) == 0 {
+			return
+		}
+	case map[string]any:
+		if len(typed) == 0 {
+			return
+		}
+	}
+	target[key] = value
+}
+
+func setMihomoMbps(target map[string]any, key string, value any) {
+	if _, exists := target[key]; exists {
+		return
+	}
+	switch typed := value.(type) {
+	case int:
+		if typed > 0 {
+			target[key] = typed
+		}
+	case int64:
+		if typed > 0 {
+			target[key] = typed
+		}
+	case float64:
+		if typed > 0 {
+			target[key] = typed
+		}
+	case json.Number:
+		if parsed, err := typed.Int64(); err == nil && parsed > 0 {
+			target[key] = parsed
+		}
+	}
+}
+
+func setMihomoHysteria2Obfs(target map[string]any, value any) {
+	obfs, ok := value.(map[string]any)
+	if !ok {
+		setMihomoValue(target, "obfs", value)
+		return
+	}
+	setMihomoValue(target, "obfs", obfs["type"])
+	setMihomoValue(target, "obfs-password", obfs["password"])
+}
+
 func mihomoGroups(groups []repository.NormalizedGroup) []map[string]any {
 	items := make([]map[string]any, 0, len(groups))
 	for _, group := range groups {
 		item := copyMap(group.Raw)
 		item["name"] = group.Tag
 		item["type"] = group.Type
-		item["proxies"] = group.Outbounds
+		outbounds := group.Outbounds
+		if len(outbounds) == 0 {
+			outbounds = []string{"DIRECT"}
+		}
+		item["proxies"] = outbounds
 		items = append(items, item)
 	}
 	return items
@@ -678,6 +988,127 @@ func mihomoRules(rules []repository.NormalizedRule) []string {
 		lines = append(lines, "MATCH,DIRECT")
 	}
 	return lines
+}
+
+func mihomoRuleProviders(rules []repository.NormalizedRule, providers []repository.MihomoRuleProviderResource, repositories []repository.RuleSourceRepository) map[string]any {
+	items := map[string]any{}
+	for _, provider := range providers {
+		if item, ok := mihomoConfiguredRuleProvider(provider, repositories); ok {
+			items[provider.Provider] = item
+		}
+	}
+	for _, providerName := range mihomoReferencedRuleProviders(rules) {
+		if _, exists := items[providerName]; exists {
+			continue
+		}
+		if item, ok := mihomoBuiltInRuleProvider(providerName, repositories); ok {
+			items[providerName] = item
+		}
+	}
+	return items
+}
+
+func mihomoConfiguredRuleProvider(provider repository.MihomoRuleProviderResource, repositories []repository.RuleSourceRepository) (map[string]any, bool) {
+	name := strings.TrimSpace(provider.Provider)
+	if name == "" {
+		return nil, false
+	}
+	item := map[string]any{}
+	setString(item, "behavior", provider.Behavior)
+	setString(item, "format", provider.Format)
+	switch provider.SourceMode {
+	case repository.RuleAssetSourceModeRepositoryFile:
+		rawURL := ""
+		for _, repo := range repositories {
+			if repo.ID != provider.RepositoryID {
+				continue
+			}
+			if value, err := repository.BuildRepositoryRawURL(repo, repository.CoreMihomo, provider.Path, provider.Ref); err == nil {
+				rawURL = value
+			}
+			break
+		}
+		if rawURL == "" {
+			return nil, false
+		}
+		item["type"] = "http"
+		item["url"] = rawURL
+		item["path"] = mihomoRuleProviderCachePath(name, provider.Format)
+	case repository.RuleAssetSourceModeRemote:
+		item["type"] = "http"
+		item["url"] = provider.URL
+		item["path"] = mihomoRuleProviderCachePath(name, provider.Format)
+	case repository.RuleAssetSourceModeLocal:
+		item["type"] = "file"
+		item["path"] = provider.LocalPath
+	default:
+		return nil, false
+	}
+	setString(item, "interval", provider.Interval)
+	return item, true
+}
+
+func mihomoReferencedRuleProviders(rules []repository.NormalizedRule) []string {
+	items := []string{}
+	for _, rule := range rules {
+		items = append(items, stringValues(rule.Fields["rule_set"])...)
+		if len(rule.Rules) > 0 {
+			items = append(items, mihomoReferencedRuleProviders(rule.Rules)...)
+		}
+		for _, raw := range rule.Raw {
+			parts := strings.Split(raw, ",")
+			if len(parts) >= 2 && strings.EqualFold(strings.TrimSpace(parts[0]), "RULE-SET") {
+				items = append(items, strings.TrimSpace(parts[1]))
+			}
+		}
+	}
+	return appendUniqueStrings(nil, items...)
+}
+
+func mihomoBuiltInRuleProvider(providerName string, repositories []repository.RuleSourceRepository) (map[string]any, bool) {
+	path := strings.TrimSpace(providerName)
+	if path == "" || !strings.Contains(path, "/") {
+		return nil, false
+	}
+	rulePath := strings.TrimSuffix(path, ".mrs") + ".mrs"
+	ruleURL := "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/" + escapePathSegments(rulePath)
+	for _, repo := range repositories {
+		if repo.ID != singBoxBuiltInRuleRepositoryID {
+			continue
+		}
+		if rawURL, err := repository.BuildRepositoryRawURL(repo, repository.CoreMihomo, rulePath, ""); err == nil {
+			ruleURL = rawURL
+		}
+		break
+	}
+	return map[string]any{
+		"type":     "http",
+		"behavior": mihomoRuleProviderBehavior(rulePath),
+		"format":   "mrs",
+		"url":      ruleURL,
+		"path":     mihomoRuleProviderCachePath(path, "mrs"),
+		"interval": 86400,
+	}, true
+}
+
+func mihomoRuleProviderBehavior(path string) string {
+	normalized := strings.ToLower(path)
+	if strings.Contains(normalized, "geoip") || strings.Contains(normalized, "ipcidr") || strings.Contains(normalized, "cidr") || strings.Contains(normalized, "/ip/") {
+		return "ipcidr"
+	}
+	return "domain"
+}
+
+func mihomoRuleProviderCachePath(providerName string, format string) string {
+	extension := strings.TrimPrefix(strings.TrimSpace(format), ".")
+	if extension == "" {
+		extension = "yaml"
+	}
+	safeName := strings.NewReplacer("\\", "_", "/", "_", ":", "_").Replace(strings.TrimSpace(providerName))
+	if safeName == "" {
+		safeName = "rule-provider"
+	}
+	return "./rule-providers/" + safeName + "." + extension
 }
 
 func mihomoDNS(config repository.GlobalConfig) map[string]any {
@@ -698,11 +1129,18 @@ func mihomoDNS(config repository.GlobalConfig) map[string]any {
 	setStrings(dns, "nameserver", mihomoDNSServersByRole(config.DNSServers, "default"))
 	setStrings(dns, "fallback", mihomoDNSServersByRole(config.DNSServers, "fallback"))
 	setStrings(dns, "direct-nameserver", mihomoDNSServersByRole(config.DNSServers, "direct"))
-	setStrings(dns, "proxy-server-nameserver", mihomoDNSServersByRole(config.DNSServers, "proxy"))
+	setStrings(dns, "proxy-server-nameserver", mihomoProxyServerNameservers(config.DNSServers))
 	if policy := mihomoNameserverPolicy(config.DNSServers, config.DNSRules); len(policy) > 0 {
 		dns["nameserver-policy"] = policy
 	}
 	return dns
+}
+
+func mihomoProxyServerNameservers(servers []repository.GlobalDNSServer) []string {
+	if items := mihomoDNSServersByRole(servers, "bootstrap"); len(items) > 0 {
+		return items
+	}
+	return mihomoDNSServersByRole(servers, "default")
 }
 
 func mihomoDNSServersByRole(servers []repository.GlobalDNSServer, role string) []string {
@@ -855,7 +1293,7 @@ func appendUniqueStrings(values []string, additions ...string) []string {
 	return result
 }
 
-func singBoxGeoIPCode(value string) string {
+func singBoxGeoRuleCode(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 
@@ -871,8 +1309,12 @@ func setStrings(target map[string]any, key string, values []string) {
 	}
 }
 
-func singBoxInbounds(inbounds []repository.ManagedInbound) []map[string]any {
+func singBoxInbounds(inbounds []repository.ManagedInbound, options ...runtimeCompileOptions) []map[string]any {
 	items := []map[string]any{}
+	compileOptions := runtimeCompileOptions{}
+	if len(options) > 0 {
+		compileOptions = options[0]
+	}
 	for _, inbound := range inbounds {
 		if !inbound.Enabled {
 			continue
@@ -898,7 +1340,7 @@ func singBoxInbounds(inbounds []repository.ManagedInbound) []map[string]any {
 			item["users"] = users
 		}
 		if inbound.Kind == "tun" {
-			mergeMap(item, singBoxInboundTun(inbound.Tun))
+			mergeMap(item, singBoxInboundTun(inbound.Tun, compileOptions))
 		}
 		items = append(items, item)
 	}
@@ -933,13 +1375,20 @@ func singBoxInboundUsers(users []repository.InboundUser) []map[string]any {
 	return items
 }
 
-func singBoxInboundTun(tun repository.InboundTun) map[string]any {
+func singBoxInboundTun(tun repository.InboundTun, options ...runtimeCompileOptions) map[string]any {
 	item := map[string]any{}
+	compileOptions := runtimeCompileOptions{}
+	if len(options) > 0 {
+		compileOptions = options[0]
+	}
 	addresses := tun.Address
 	if len(addresses) == 0 {
 		addresses = []string{"172.19.0.1/30"}
 	}
 	setStrings(item, "address", addresses)
+	if compileOptions.SingBoxDNS14 {
+		item["dns_mode"] = "hijack"
+	}
 	setString(item, "interface_name", tun.InterfaceName)
 	setString(item, "stack", tun.Stack)
 	setInt(item, "mtu", tun.MTU)
@@ -976,6 +1425,11 @@ func singBoxOutbounds(nodes []repository.NormalizedNode, groups []repository.Nor
 	items := []map[string]any{{"type": "direct", "tag": "DIRECT"}, {"type": "block", "tag": "REJECT"}}
 	for _, node := range nodes {
 		item := copyMap(node.Transport)
+		delete(item, "udp")
+		delete(item, "mihomo_ip_version")
+		if node.Type == "vless" {
+			delete(item, "encryption")
+		}
 		item["type"] = node.Type
 		item["tag"] = node.Tag
 		if node.Server != "" {
@@ -992,18 +1446,92 @@ func singBoxOutbounds(nodes []repository.NormalizedNode, groups []repository.Nor
 	return items
 }
 
-func singBoxGroup(group repository.NormalizedGroup) map[string]any {
-	item := map[string]any{
-		"type":      singBoxGroupType(group.Type),
-		"tag":       group.Tag,
-		"outbounds": group.Outbounds,
+func singBoxRuleSetDownloadDetour(nodes []repository.NormalizedNode, groups []repository.NormalizedGroup, rules []repository.NormalizedRule) string {
+	available := map[string]bool{"DIRECT": true, "REJECT": true}
+	for _, node := range nodes {
+		if tag := strings.TrimSpace(node.Tag); tag != "" {
+			available[tag] = true
+		}
 	}
-	for _, key := range []string{"url", "interval", "tolerance"} {
-		if value, ok := group.Raw[key]; ok {
-			item[key] = value
+	for _, group := range groups {
+		if tag := strings.TrimSpace(group.Tag); tag != "" {
+			available[tag] = true
+		}
+	}
+	if detour := firstProxyOutboundFromRules(rules, available); detour != "" {
+		return detour
+	}
+	for _, group := range groups {
+		if tag := strings.TrimSpace(group.Tag); tag != "" {
+			return tag
+		}
+	}
+	for _, node := range nodes {
+		if tag := strings.TrimSpace(node.Tag); tag != "" {
+			return tag
+		}
+	}
+	return ""
+}
+
+func firstProxyOutboundFromRules(rules []repository.NormalizedRule, available map[string]bool) string {
+	for _, rule := range rules {
+		outbound := normalizeSingBoxBuiltInOutboundTag(rule.Outbound)
+		if outbound != "" && available[outbound] && outbound != "DIRECT" && outbound != "REJECT" {
+			return outbound
+		}
+		if detour := firstProxyOutboundFromRules(rule.Rules, available); detour != "" {
+			return detour
+		}
+	}
+	return ""
+}
+
+func singBoxGroup(group repository.NormalizedGroup) map[string]any {
+	groupType := singBoxGroupType(group.Type)
+	item := map[string]any{
+		"type":      groupType,
+		"tag":       group.Tag,
+		"outbounds": normalizeSingBoxBuiltInOutboundTags(group.Outbounds),
+	}
+	if groupType == "urltest" {
+		for _, key := range []string{"url", "tolerance"} {
+			if value, ok := group.Raw[key]; ok {
+				item[key] = value
+			}
+		}
+		if value, ok := group.Raw["interval"]; ok {
+			setString(item, "interval", singBoxDurationSecondsString(value))
 		}
 	}
 	return item
+}
+
+func singBoxDurationSecondsString(value any) string {
+	switch typed := value.(type) {
+	case int:
+		if typed > 0 {
+			return strconv.Itoa(typed) + "ms"
+		}
+	case int64:
+		if typed > 0 {
+			return strconv.FormatInt(typed, 10) + "ms"
+		}
+	case float64:
+		if typed > 0 {
+			return strconv.FormatFloat(typed, 'f', -1, 64) + "ms"
+		}
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return ""
+		}
+		if _, err := strconv.ParseFloat(trimmed, 64); err == nil {
+			return trimmed + "ms"
+		}
+		return trimmed
+	}
+	return ""
 }
 
 func singBoxRules(rules []repository.NormalizedRule) []map[string]any {
@@ -1024,7 +1552,11 @@ func singBoxRule(rule repository.NormalizedRule) (map[string]any, bool) {
 	item := copyMap(rule.Fields)
 	if geoIPValues := stringValues(item["geoip"]); len(geoIPValues) > 0 {
 		delete(item, "geoip")
-		item["rule_set"] = appendUniqueStrings(stringValues(item["rule_set"]), singBoxBuiltInGeoIPRuleSetTags(geoIPValues)...)
+		item["rule_set"] = appendUniqueStrings(stringValues(item["rule_set"]), singBoxBuiltInRuleSetTags("geoip", geoIPValues)...)
+	}
+	if geositeValues := stringValues(item["geosite"]); len(geositeValues) > 0 {
+		delete(item, "geosite")
+		item["rule_set"] = appendUniqueStrings(stringValues(item["rule_set"]), singBoxBuiltInRuleSetTags("geosite", geositeValues)...)
 	}
 	if rule.Type != "" {
 		item["type"] = rule.Type
@@ -1040,7 +1572,7 @@ func singBoxRule(rule repository.NormalizedRule) (map[string]any, bool) {
 		item["rules"] = nested
 	}
 	if rule.Outbound != "" {
-		item["outbound"] = rule.Outbound
+		item["outbound"] = normalizeSingBoxBuiltInOutboundTag(rule.Outbound)
 	}
 	if rule.Action != "" {
 		item["action"] = rule.Action
@@ -1048,25 +1580,48 @@ func singBoxRule(rule repository.NormalizedRule) (map[string]any, bool) {
 	return item, len(item) > 0
 }
 
+func normalizeSingBoxBuiltInOutboundTags(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		result = append(result, normalizeSingBoxBuiltInOutboundTag(value))
+	}
+	return result
+}
+
+func normalizeSingBoxBuiltInOutboundTag(value string) string {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "DIRECT":
+		return "DIRECT"
+	case "REJECT", "REJECT-DROP", "BLOCK":
+		return "REJECT"
+	default:
+		return value
+	}
+}
+
 func singBoxRuleHasRemovedSourceGeoIP(rule repository.NormalizedRule) bool {
 	_, ok := rule.Fields["source_geoip"]
 	return ok
 }
 
-func singBoxBuiltInGeoIPRuleSetTags(values []string) []string {
+func singBoxBuiltInRuleSetTags(kind string, values []string) []string {
 	tags := make([]string, 0, len(values))
 	for _, value := range values {
-		if code := singBoxGeoIPCode(value); code != "" {
-			tags = append(tags, "geoip-"+code)
+		if code := singBoxGeoRuleCode(value); code != "" {
+			tags = append(tags, kind+"-"+code)
 		}
 	}
 	return appendUniqueStrings(nil, tags...)
 }
 
-func singBoxRoute(config repository.GlobalConfig, rules []repository.NormalizedRule, ruleSets []repository.SingBoxRuleSetResource, repositories []repository.RuleSourceRepository) map[string]any {
+func singBoxRoute(config repository.GlobalConfig, rules []repository.NormalizedRule, ruleSets []repository.SingBoxRuleSetResource, repositories []repository.RuleSourceRepository, downloadDetour ...string) map[string]any {
 	fields := config.Fields
-	route := map[string]any{"rules": append(singBoxDefaultRouteRules(), singBoxRules(rules)...)}
-	if renderedRuleSets := singBoxRouteRuleSets(rules, ruleSets, repositories); len(renderedRuleSets) > 0 {
+	route := map[string]any{"rules": append(singBoxDefaultRouteRules(config), singBoxRules(rules)...)}
+	detour := ""
+	if len(downloadDetour) > 0 {
+		detour = downloadDetour[0]
+	}
+	if renderedRuleSets := singBoxRouteRuleSets(rules, ruleSets, repositories, detour); len(renderedRuleSets) > 0 {
 		route["rule_set"] = renderedRuleSets
 	}
 	if resolver := singBoxDefaultDomainResolver(config); len(resolver) > 0 {
@@ -1085,26 +1640,26 @@ func singBoxRoute(config repository.GlobalConfig, rules []repository.NormalizedR
 	return route
 }
 
-func singBoxRouteRuleSets(rules []repository.NormalizedRule, ruleSets []repository.SingBoxRuleSetResource, repositories []repository.RuleSourceRepository) []map[string]any {
+func singBoxRouteRuleSets(rules []repository.NormalizedRule, ruleSets []repository.SingBoxRuleSetResource, repositories []repository.RuleSourceRepository, downloadDetour string) []map[string]any {
 	items := []map[string]any{}
 	seen := map[string]bool{}
-	for _, item := range singBoxConfiguredRuleSets(ruleSets, repositories) {
+	for _, item := range singBoxConfiguredRuleSets(ruleSets, repositories, downloadDetour) {
 		if tag, ok := item["tag"].(string); ok && tag != "" && !seen[tag] {
 			seen[tag] = true
 			items = append(items, item)
 		}
 	}
-	for _, tag := range singBoxReferencedBuiltInGeoIPRuleSetTags(rules) {
+	for _, tag := range singBoxReferencedBuiltInRuleSetTags(rules) {
 		if seen[tag] {
 			continue
 		}
 		seen[tag] = true
-		items = append(items, singBoxBuiltInGeoIPRuleSet(tag, repositories))
+		items = append(items, singBoxBuiltInRuleSet(tag, repositories, downloadDetour))
 	}
 	return items
 }
 
-func singBoxConfiguredRuleSets(ruleSets []repository.SingBoxRuleSetResource, repositories []repository.RuleSourceRepository) []map[string]any {
+func singBoxConfiguredRuleSets(ruleSets []repository.SingBoxRuleSetResource, repositories []repository.RuleSourceRepository, downloadDetour string) []map[string]any {
 	repositoriesByID := map[string]repository.RuleSourceRepository{}
 	for _, repo := range repositories {
 		repositoriesByID[repo.ID] = repo
@@ -1128,9 +1683,11 @@ func singBoxConfiguredRuleSets(ruleSets []repository.SingBoxRuleSetResource, rep
 			}
 			item["type"] = "remote"
 			item["url"] = rawURL
+			setString(item, "download_detour", downloadDetour)
 		case repository.RuleAssetSourceModeRemote:
 			item["type"] = "remote"
 			item["url"] = ruleSet.URL
+			setString(item, "download_detour", downloadDetour)
 		case repository.RuleAssetSourceModeLocal:
 			item["type"] = "local"
 			item["path"] = ruleSet.LocalPath
@@ -1143,43 +1700,112 @@ func singBoxConfiguredRuleSets(ruleSets []repository.SingBoxRuleSetResource, rep
 	return items
 }
 
-func singBoxReferencedBuiltInGeoIPRuleSetTags(rules []repository.NormalizedRule) []string {
+func singBoxReferencedBuiltInRuleSetTags(rules []repository.NormalizedRule) []string {
 	tags := []string{}
 	for _, rule := range rules {
-		tags = append(tags, singBoxBuiltInGeoIPRuleSetTags(stringValues(rule.Fields["geoip"]))...)
+		tags = append(tags, singBoxBuiltInRuleSetTagsFromRuleSetValues(stringValues(rule.Fields["rule_set"]))...)
+		tags = append(tags, singBoxBuiltInRuleSetTags("geoip", stringValues(rule.Fields["geoip"]))...)
+		tags = append(tags, singBoxBuiltInRuleSetTags("geosite", stringValues(rule.Fields["geosite"]))...)
 		if len(rule.Rules) > 0 {
-			tags = append(tags, singBoxReferencedBuiltInGeoIPRuleSetTags(rule.Rules)...)
+			tags = append(tags, singBoxReferencedBuiltInRuleSetTags(rule.Rules)...)
 		}
 	}
 	return appendUniqueStrings(nil, tags...)
 }
 
-func singBoxBuiltInGeoIPRuleSet(tag string, repositories []repository.RuleSourceRepository) map[string]any {
-	code := strings.TrimPrefix(tag, "geoip-")
-	ruleSetURL := "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/" + url.PathEscape(code) + ".srs"
-	for _, repo := range repositories {
-		if repo.ID != singBoxBuiltInGeoIPRepositoryID {
+func singBoxBuiltInRuleSetTagsFromRuleSetValues(values []string) []string {
+	tags := []string{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
 			continue
 		}
-		if rawURL, err := repository.BuildRepositoryRawURL(repo, repository.CoreSingBox, "geo/geoip/"+code+".srs", ""); err == nil {
+		if strings.Contains(value, "/") || strings.HasPrefix(value, "geoip-") || strings.HasPrefix(value, "geosite-") {
+			tags = append(tags, value)
+		}
+	}
+	return appendUniqueStrings(nil, tags...)
+}
+
+func singBoxBuiltInRuleSet(tag string, repositories []repository.RuleSourceRepository, downloadDetour string) map[string]any {
+	if strings.Contains(tag, "/") {
+		ruleSetPath := strings.TrimSuffix(tag, ".srs") + ".srs"
+		ruleSetURL := "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/" + escapePathSegments(ruleSetPath)
+		for _, repo := range repositories {
+			if repo.ID != singBoxBuiltInRuleRepositoryID {
+				continue
+			}
+			if rawURL, err := repository.BuildRepositoryRawURL(repo, repository.CoreSingBox, ruleSetPath, ""); err == nil {
+				ruleSetURL = rawURL
+			}
+			break
+		}
+		return singBoxRemoteRuleSet(tag, ruleSetURL, downloadDetour)
+	}
+
+	kind, code, ok := strings.Cut(tag, "-")
+	if !ok {
+		kind = "geoip"
+		code = strings.TrimPrefix(tag, "geoip-")
+	}
+	ruleSetURL := "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/" + kind + "/" + url.PathEscape(code) + ".srs"
+	for _, repo := range repositories {
+		if repo.ID != singBoxBuiltInRuleRepositoryID {
+			continue
+		}
+		if rawURL, err := repository.BuildRepositoryRawURL(repo, repository.CoreSingBox, "geo/"+kind+"/"+code+".srs", ""); err == nil {
 			ruleSetURL = rawURL
 		}
 		break
 	}
-	return map[string]any{
+	return singBoxRemoteRuleSet(tag, ruleSetURL, downloadDetour)
+}
+
+func singBoxRemoteRuleSet(tag string, ruleSetURL string, downloadDetour string) map[string]any {
+	item := map[string]any{
 		"type":   "remote",
 		"tag":    tag,
 		"format": "binary",
 		"url":    ruleSetURL,
 	}
+	setString(item, "download_detour", downloadDetour)
+	return item
 }
 
-func singBoxDefaultRouteRules() []map[string]any {
-	return []map[string]any{
-		map[string]any{"action": "sniff"},
-		map[string]any{"protocol": "dns", "action": "hijack-dns"},
-		map[string]any{"ip_is_private": true, "outbound": "direct"},
+func escapePathSegments(value string) string {
+	segments := strings.Split(value, "/")
+	for index, segment := range segments {
+		segments[index] = url.PathEscape(segment)
 	}
+	return strings.Join(segments, "/")
+}
+
+func singBoxDefaultRouteRules(config ...repository.GlobalConfig) []map[string]any {
+	fields := map[string]any{}
+	if len(config) > 0 {
+		fields = config[0].Fields
+	}
+	rules := []map[string]any{
+		map[string]any{"action": "sniff"},
+		map[string]any{
+			"type": "logical",
+			"mode": "or",
+			"rules": []map[string]any{
+				{"protocol": []string{"dns"}},
+				{"port": 53},
+			},
+			"action": "hijack-dns",
+		},
+	}
+	if boolField(fields, "routeBlockQuic", true) {
+		rules = append(rules, map[string]any{
+			"protocol": []string{"quic"},
+			"action":   "reject",
+			"method":   "drop",
+		})
+	}
+	rules = append(rules, map[string]any{"ip_is_private": true, "outbound": "DIRECT"})
+	return rules
 }
 
 func singBoxDefaultDomainResolver(config repository.GlobalConfig) map[string]any {
@@ -1196,10 +1822,14 @@ func singBoxDefaultDomainResolver(config repository.GlobalConfig) map[string]any
 	return resolver
 }
 
-func singBoxDNSServers(servers []repository.GlobalDNSServer) []map[string]any {
+func singBoxDNSServers(servers []repository.GlobalDNSServer, proxyDetour ...string) []map[string]any {
 	items := []map[string]any{}
+	detour := ""
+	if len(proxyDetour) > 0 {
+		detour = proxyDetour[0]
+	}
 	for _, server := range servers {
-		item := singBoxDNSServer(server, len(items))
+		item := singBoxDNSServer(server, len(items), detour)
 		if len(item) == 0 {
 			continue
 		}
@@ -1210,7 +1840,7 @@ func singBoxDNSServers(servers []repository.GlobalDNSServer) []map[string]any {
 
 func singBoxDNS(config repository.GlobalConfig, options runtimeCompileOptions) map[string]any {
 	fields := config.Fields
-	servers := singBoxDNSServers(config.DNSServers)
+	servers := singBoxDNSServers(config.DNSServers, options.ProxyDNSDetour)
 	if fakeIP := singBoxDNSFakeIPServer(fields); len(fakeIP) > 0 {
 		servers = append(servers, fakeIP)
 	}
@@ -1521,10 +2151,14 @@ func firstDNSServerName(servers []repository.GlobalDNSServer) string {
 	return ""
 }
 
-func singBoxDNSServer(server repository.GlobalDNSServer, index int) map[string]any {
+func singBoxDNSServer(server repository.GlobalDNSServer, index int, proxyDetour ...string) map[string]any {
 	tag := strings.TrimSpace(server.Name)
 	protocol := strings.TrimSpace(server.Protocol)
 	address := strings.TrimSpace(server.Address)
+	detour := strings.TrimSpace(server.Detour)
+	if len(proxyDetour) > 0 && detour == "" && strings.TrimSpace(server.Role) == "proxy" {
+		detour = strings.TrimSpace(proxyDetour[0])
+	}
 	if tag == "" {
 		tag = fmt.Sprintf("%s-%d", server.Role, index+1)
 	}
@@ -1545,7 +2179,7 @@ func singBoxDNSServer(server repository.GlobalDNSServer, index int) map[string]a
 	if (protocol == "https" || protocol == "h3") && strings.TrimSpace(server.Path) != "" {
 		item["path"] = strings.TrimSpace(server.Path)
 	}
-	setString(item, "detour", server.Detour)
+	setString(item, "detour", detour)
 	setString(item, "client_subnet", server.ClientSubnet)
 	if server.SkipCertVerify {
 		item["tls"] = map[string]any{"insecure": true}
@@ -1565,13 +2199,15 @@ func singBoxDNSPort(value string) int {
 }
 
 func singBoxGroupType(groupType string) string {
-	switch groupType {
+	switch strings.ToLower(strings.TrimSpace(groupType)) {
 	case "select", "selector":
 		return "selector"
 	case "urltest", "url-test":
 		return "urltest"
 	case "fallback":
 		return "urltest"
+	case "load-balance", "load_balance":
+		return "selector"
 	default:
 		return groupType
 	}

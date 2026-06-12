@@ -2,6 +2,7 @@ package importer
 
 import (
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/atlantis-mk/FastProxy-Server/internal/repository"
@@ -98,7 +99,7 @@ rules:
 		t.Fatalf("serialized rule should flatten domain_suffix to top level: %s", string(serializedRule))
 	}
 	middleDirectRule := result.RuleSet.Rules[1]
-	if middleDirectRule.Type != "" || middleDirectRule.Outbound != "direct" {
+	if middleDirectRule.Type != "" || middleDirectRule.Outbound != "DIRECT" {
 		t.Fatalf("middle direct rule should stay standalone to preserve order: %+v", middleDirectRule)
 	}
 	secondAutoRule := result.RuleSet.Rules[2]
@@ -106,8 +107,8 @@ rules:
 		t.Fatalf("second auto rule should stay standalone after direct split: %+v", secondAutoRule)
 	}
 	directRule := result.RuleSet.Rules[3]
-	if directRule.Outbound != "direct" {
-		t.Fatalf("final direct rule outbound = %q, want direct", directRule.Outbound)
+	if directRule.Outbound != "DIRECT" {
+		t.Fatalf("final direct rule outbound = %q, want DIRECT", directRule.Outbound)
 	}
 
 	bootstrap, err := store.Bootstrap()
@@ -126,6 +127,91 @@ rules:
 		len(bootstrap.MihomoRuleProviders) != 0 ||
 		len(routingRuleSets) != 1 {
 		t.Fatalf("unexpected repository counts: %+v", bootstrap)
+	}
+}
+
+func TestImportClashPreservesCommonProxyFields(t *testing.T) {
+	store, err := repository.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	service := NewService(store)
+
+	result, err := service.ImportClash(ClashImportInput{
+		Name: "Common",
+		Content: `
+proxies:
+  - name: tuned
+    type: ss
+    server: tuned.example.com
+    port: 443
+    cipher: 2022-blake3-aes-128-gcm
+    password: secret
+    ip-version: ipv4-prefer
+    udp: true
+    interface-name: en0
+    routing-mark: 1234
+    tfo: true
+    mptcp: true
+    dialer-proxy: relay
+    connect_timeout: 5s
+    udp_fragment: true
+    network_strategy: hybrid
+    network_type: [wifi, ethernet]
+    fallback_delay: 250ms
+    smux:
+      enabled: true
+      protocol: smux
+      max-connections: 4
+      min-streams: 2
+      max-streams: 16
+      padding: true
+      brutal-opts:
+        enabled: true
+        up: 50
+        down: 100
+`,
+	})
+	if err != nil {
+		t.Fatalf("ImportClash() error = %v", err)
+	}
+	if result.NodeSet == nil || len(result.NodeSet.Nodes) != 1 {
+		t.Fatalf("imported nodes = %#v, want one node", result.NodeSet)
+	}
+
+	transport := result.NodeSet.Nodes[0].Transport
+	expected := map[string]any{
+		"method":            "2022-blake3-aes-128-gcm",
+		"password":          "secret",
+		"mihomo_ip_version": "ipv4-prefer",
+		"domain_strategy":   "prefer_ipv4",
+		"udp":               true,
+		"bind_interface":    "en0",
+		"routing_mark":      1234,
+		"tcp_fast_open":     true,
+		"tcp_multi_path":    true,
+		"detour":            "relay",
+		"connect_timeout":   "5s",
+		"udp_fragment":      true,
+		"network_strategy":  "hybrid",
+		"network_type":      []any{"wifi", "ethernet"},
+		"fallback_delay":    "250ms",
+		"multiplex": map[string]any{
+			"enabled":         true,
+			"protocol":        "smux",
+			"max_connections": 4,
+			"min_streams":     2,
+			"max_streams":     16,
+			"padding":         true,
+			"brutal": map[string]any{
+				"enabled":   true,
+				"up_mbps":   50,
+				"down_mbps": 100,
+			},
+		},
+	}
+	if !reflect.DeepEqual(transport, expected) {
+		t.Fatalf("transport = %#v, want %#v", transport, expected)
 	}
 }
 
@@ -268,12 +354,46 @@ rules:
 	}
 
 	rule := result.RuleSet.Rules[0]
-	if rule.Outbound != "direct" {
-		t.Fatalf("rule.Outbound = %q, want direct", rule.Outbound)
+	if rule.Outbound != "DIRECT" {
+		t.Fatalf("rule.Outbound = %q, want DIRECT", rule.Outbound)
 	}
 	ipCIDR, _ := rule.Fields["ip_cidr"].([]string)
 	if len(ipCIDR) != 1 || ipCIDR[0] != "127.0.0.0/8" {
 		t.Fatalf("rule.Fields[ip_cidr] = %#v, want [127.0.0.0/8]", rule.Fields["ip_cidr"])
+	}
+}
+
+func TestImportClashNormalizesBuiltInOutboundTags(t *testing.T) {
+	store, err := repository.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	service := NewService(store)
+
+	result, err := service.ImportClash(ClashImportInput{
+		Name: "BuiltIns",
+		Content: `
+rules:
+  - DOMAIN,example.com,direct
+  - DOMAIN,ads.example.com,REJECT
+  - DOMAIN,drop.example.com,REJECT-DROP
+`,
+	})
+	if err != nil {
+		t.Fatalf("ImportClash() error = %v", err)
+	}
+	if result.RuleSet == nil || len(result.RuleSet.Rules) != 2 {
+		t.Fatalf("expected two generated rule set rules after aggregation, got %+v", result.RuleSet)
+	}
+	if result.RuleSet.Rules[0].Outbound != "DIRECT" {
+		t.Fatalf("rule[0].Outbound = %q, want DIRECT", result.RuleSet.Rules[0].Outbound)
+	}
+	if result.RuleSet.Rules[1].Outbound != "REJECT" {
+		t.Fatalf("rule[1].Outbound = %q, want REJECT", result.RuleSet.Rules[1].Outbound)
+	}
+	rejectedDomains, _ := result.RuleSet.Rules[1].Fields["domain"].([]string)
+	if len(rejectedDomains) != 2 || rejectedDomains[0] != "ads.example.com" || rejectedDomains[1] != "drop.example.com" {
+		t.Fatalf("REJECT domains = %#v, want both rejected domains", result.RuleSet.Rules[1].Fields["domain"])
 	}
 }
 

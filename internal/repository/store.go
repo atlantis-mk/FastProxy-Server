@@ -20,8 +20,6 @@ import (
 var ErrNotFound = errors.New("resource not found")
 var ErrDuplicateNodeName = errors.New("duplicate node name")
 
-const stateResourceKind = "_state"
-const activeStateResourceID = "active"
 const configResourceKind = "_config"
 const globalConfigResourceID = "global"
 
@@ -32,6 +30,12 @@ var defaultDNSNameservers = []string{
 	"tls://223.6.6.6:853",
 	"tls://120.53.53.53",
 	"tls://1.12.12.12",
+}
+
+var defaultProxyDNSNameservers = []string{
+	"https://1.1.1.1/dns-query",
+	"https://8.8.8.8/dns-query",
+	"https://9.9.9.9/dns-query",
 }
 
 var defaultDNSFakeIPFilter = []string{
@@ -220,9 +224,6 @@ func NewStore(root string) (*Store, error) {
 		return nil, err
 	}
 	store.db = db
-	if err := store.ensureState(); err != nil {
-		return nil, err
-	}
 	return store, nil
 }
 
@@ -308,10 +309,6 @@ func (s *Store) Bootstrap() (Bootstrap, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	state, err := s.readState()
-	if err != nil {
-		return Bootstrap{}, err
-	}
 	profiles, err := s.listProfiles()
 	if err != nil {
 		return Bootstrap{}, err
@@ -349,7 +346,6 @@ func (s *Store) Bootstrap() (Bootstrap, error) {
 		return Bootstrap{}, err
 	}
 	return Bootstrap{
-		State:                  state,
 		Profiles:               profiles,
 		Subscriptions:          subscriptions,
 		NodeSets:               nodeSets,
@@ -360,31 +356,6 @@ func (s *Store) Bootstrap() (Bootstrap, error) {
 		GroupSets:              groupSets,
 		Config:                 config,
 	}, nil
-}
-
-func (s *Store) State() (State, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.readState()
-}
-
-func (s *Store) SetActiveProfile(id string) (State, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, err := s.readProfile(id); err != nil {
-		return State{}, err
-	}
-	state, err := s.readState()
-	if err != nil {
-		return State{}, err
-	}
-	state.ActiveProfileID = id
-	state.UpdatedAt = time.Now().UTC()
-	if err := s.writeState(state); err != nil {
-		return State{}, err
-	}
-	return state, nil
 }
 
 func (s *Store) ListProfiles() ([]ProfileResource, error) {
@@ -406,17 +377,6 @@ func (s *Store) CreateProfile(input ProfileResource) (ProfileResource, error) {
 	item := normalizeProfile(input, ProfileResource{})
 	if err := s.writeProfile(item); err != nil {
 		return ProfileResource{}, err
-	}
-	state, err := s.readState()
-	if err != nil {
-		return ProfileResource{}, err
-	}
-	if state.ActiveProfileID == "" {
-		state.ActiveProfileID = item.ID
-		state.UpdatedAt = time.Now().UTC()
-		if err := s.writeState(state); err != nil {
-			return ProfileResource{}, err
-		}
 	}
 	return item, nil
 }
@@ -495,17 +455,6 @@ func (s *Store) DeleteProfile(id string) error {
 	if _, err := s.db.Exec(`DELETE FROM profiles WHERE profile_id = ?`, id); err != nil {
 		return err
 	}
-	state, err := s.readState()
-	if err != nil {
-		return err
-	}
-	if state.ActiveProfileID == id {
-		state.ActiveProfileID = ""
-		state.UpdatedAt = time.Now().UTC()
-		if err := s.writeState(state); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -565,14 +514,14 @@ func (s *Store) DeleteSubscription(id string) error {
 	if err != nil {
 		return convertNotFound(err)
 	}
-	if err := s.deleteResource(KindSubscription, item.ID, nil); err != nil {
+	if err := s.deleteResource(KindSubscription, item.ID); err != nil {
 		return err
 	}
 	if err := s.deleteManagedNodeSetLocked(SubscriptionNodeSetName(item.Name)); err != nil && !errors.Is(err, ErrNotFound) {
 		return err
 	}
-	_ = s.deleteResource(KindRoutingRuleSet, SubscriptionRuleSetName(item.Name), nil)
-	_ = s.deleteResource(KindGroupSet, SubscriptionGroupSetName(item.Name), nil)
+	_ = s.deleteResource(KindRoutingRuleSet, SubscriptionRuleSetName(item.Name))
+	_ = s.deleteResource(KindGroupSet, SubscriptionGroupSetName(item.Name))
 
 	profiles, err := s.listProfiles()
 	if err != nil {
@@ -643,7 +592,7 @@ func (s *Store) DeleteNodeSet(id string) error {
 	} else if !errors.Is(err, ErrNotFound) {
 		return err
 	}
-	return s.deleteResource(KindNodeSet, id, nil)
+	return s.deleteResource(KindNodeSet, id)
 }
 
 func (s *Store) UpsertManagedNodeSet(input NodeSetResource) (NodeSetResource, error) {
@@ -705,7 +654,7 @@ func (s *Store) UpdateRuleSet(id string, input RuleSetResource) (RuleSetResource
 func (s *Store) DeleteRuleSet(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.deleteResource(KindRoutingRuleSet, id, nil)
+	return s.deleteResource(KindRoutingRuleSet, id)
 }
 
 func (s *Store) ListRuleSourceRepositories() ([]RuleSourceRepository, error) {
@@ -767,7 +716,7 @@ func (s *Store) DeleteRuleSourceRepository(id string) error {
 	if _, ok := builtInRuleSourceRepository(id); ok {
 		return ErrBuiltInRepositoryReadOnly
 	}
-	if err := s.deleteResource(KindRuleSourceRepo, id, nil); err != nil {
+	if err := s.deleteResource(KindRuleSourceRepo, id); err != nil {
 		return err
 	}
 	return s.deleteRuleSourceIndexFromDB(id)
@@ -1071,7 +1020,7 @@ func (s *Store) UpdateSingBoxRuleSet(id string, input SingBoxRuleSetResource) (S
 func (s *Store) DeleteSingBoxRuleSet(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.deleteResource(KindSingBoxRuleSet, id, nil)
+	return s.deleteResource(KindSingBoxRuleSet, id)
 }
 
 func (s *Store) ListMihomoRuleProviders() ([]MihomoRuleProviderResource, error) {
@@ -1127,7 +1076,7 @@ func (s *Store) UpdateMihomoRuleProvider(id string, input MihomoRuleProviderReso
 func (s *Store) DeleteMihomoRuleProvider(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.deleteResource(KindMihomoRuleProvider, id, nil)
+	return s.deleteResource(KindMihomoRuleProvider, id)
 }
 
 func (s *Store) ListGroupSets() ([]GroupSetResource, error) {
@@ -1171,7 +1120,7 @@ func (s *Store) UpdateGroupSet(id string, input GroupSetResource) (GroupSetResou
 func (s *Store) DeleteGroupSet(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.deleteResource(KindGroupSet, id, nil)
+	return s.deleteResource(KindGroupSet, id)
 }
 
 func (s *Store) listProfiles() ([]ProfileResource, error) {
@@ -1320,39 +1269,6 @@ func (s *Store) writeProfile(item ProfileResource) error {
 	return err
 }
 
-func (s *Store) readState() (State, error) {
-	var state State
-	if err := s.readRepositoryResource(stateResourceKind, activeStateResourceID, &state); errors.Is(err, sql.ErrNoRows) {
-		state = State{UpdatedAt: time.Now().UTC()}
-		if writeErr := s.writeState(state); writeErr != nil {
-			return State{}, writeErr
-		}
-		return state, nil
-	} else if err != nil {
-		return State{}, err
-	}
-	return state, nil
-}
-
-func (s *Store) writeState(state State) error {
-	if state.UpdatedAt.IsZero() {
-		state.UpdatedAt = time.Now().UTC()
-	}
-	return s.writeRepositoryResource(
-		stateResourceKind,
-		activeStateResourceID,
-		activeStateResourceID,
-		state.UpdatedAt,
-		state.UpdatedAt,
-		state,
-	)
-}
-
-func (s *Store) ensureState() error {
-	_, err := s.readState()
-	return err
-}
-
 func (s *Store) globalConfig() (GlobalConfig, error) {
 	var config GlobalConfig
 	if err := s.readRepositoryResource(configResourceKind, globalConfigResourceID, &config); errors.Is(err, sql.ErrNoRows) {
@@ -1396,6 +1312,9 @@ func backfillGlobalConfigDefaults(config GlobalConfig, updatedAt time.Time) (Glo
 	}
 	if len(config.DNSServers) == 0 {
 		config.DNSServers = defaultGlobalDNSServers()
+		changed = true
+	} else if hasLegacyDefaultProxyDNSServers(config.DNSServers) {
+		config.DNSServers = replaceLegacyDefaultProxyDNSServers(config.DNSServers)
 		changed = true
 	}
 	if len(config.Inbounds) == 0 {
@@ -1451,7 +1370,10 @@ func defaultGlobalConfigFields() map[string]any {
 		"ntpWriteToSystem":               true,
 		"profileStoreSelected":           true,
 		"routeAutoDetectInterface":       true,
+		"routeBlockQuic":                 true,
 		"secret":                         "Yi9ImtJh",
+		"selectedCore":                   string(CoreMihomo),
+		"routingRuleSetIds":              []string{},
 		"snifferEnabled":                 true,
 		"snifferForceDomain":             "+.netflix.com\n+.nflxvideo.net\n+.amazonaws.com\n+.media.dssott.com",
 		"snifferHttpOverrideDestination": true,
@@ -1518,36 +1440,43 @@ func defaultGlobalInbounds() []ManagedInbound {
 				AutoRedirect:        false,
 				AutoDetectInterface: false,
 				StrictRoute:         false,
-				DNSHijack:           []string{"127.0.0.1:53"},
+				DNSHijack:           []string{"any:53"},
 			},
 		},
 	})
 }
 
 func defaultGlobalDNSServers() []GlobalDNSServer {
-	servers := make([]GlobalDNSServer, 0, len(defaultDNSNameservers)*2)
-	for _, role := range []string{"default", "proxy"} {
-		for index, endpoint := range defaultDNSNameservers {
-			protocol, address, port := parseDefaultDNSServerEndpoint(endpoint)
-			servers = append(servers, GlobalDNSServer{
-				ID:       fmt.Sprintf("dns-%s-%d", role, index+1),
-				Name:     fmt.Sprintf("%s-%d", role, index+1),
-				Role:     role,
-				Protocol: protocol,
-				Address:  address,
-				Port:     port,
-			})
-		}
+	servers := make([]GlobalDNSServer, 0, len(defaultDNSNameservers)+len(defaultProxyDNSNameservers))
+	for index, endpoint := range defaultDNSNameservers {
+		protocol, address, port, path := parseDefaultDNSServerEndpoint(endpoint)
+		servers = append(servers, GlobalDNSServer{
+			ID:       fmt.Sprintf("dns-default-%d", index+1),
+			Name:     fmt.Sprintf("default-%d", index+1),
+			Role:     "default",
+			Protocol: protocol,
+			Address:  address,
+			Port:     port,
+			Path:     path,
+		})
 	}
+	servers = append(servers, proxyDefaultDNSServers()...)
 	return servers
 }
 
-func parseDefaultDNSServerEndpoint(endpoint string) (string, string, string) {
+func parseDefaultDNSServerEndpoint(endpoint string) (string, string, string, string) {
 	protocol := "udp"
 	target := endpoint
 	if scheme, rest, ok := strings.Cut(endpoint, "://"); ok {
 		protocol = scheme
 		target = rest
+	}
+	path := ""
+	if protocol == "https" || protocol == "h3" {
+		if host, value, ok := strings.Cut(target, "/"); ok {
+			target = host
+			path = "/" + strings.TrimLeft(value, "/")
+		}
 	}
 	address := target
 	port := ""
@@ -1557,7 +1486,61 @@ func parseDefaultDNSServerEndpoint(endpoint string) (string, string, string) {
 	} else if protocol == "udp" {
 		port = "53"
 	}
-	return protocol, address, port
+	return protocol, address, port, path
+}
+
+func hasLegacyDefaultProxyDNSServers(servers []GlobalDNSServer) bool {
+	proxyServers := make([]GlobalDNSServer, 0, len(servers))
+	for _, server := range servers {
+		if strings.TrimSpace(server.Role) == "proxy" {
+			proxyServers = append(proxyServers, server)
+		}
+	}
+	if len(proxyServers) != len(defaultDNSNameservers) {
+		return false
+	}
+	for index, endpoint := range defaultDNSNameservers {
+		if !dnsServerMatchesEndpoint(proxyServers[index], endpoint) {
+			return false
+		}
+	}
+	return true
+}
+
+func replaceLegacyDefaultProxyDNSServers(servers []GlobalDNSServer) []GlobalDNSServer {
+	next := make([]GlobalDNSServer, 0, len(servers)-len(defaultDNSNameservers)+len(defaultProxyDNSNameservers))
+	for _, server := range servers {
+		if strings.TrimSpace(server.Role) != "proxy" {
+			next = append(next, server)
+		}
+	}
+	next = append(next, proxyDefaultDNSServers()...)
+	return normalizeGlobalDNSServers(next)
+}
+
+func proxyDefaultDNSServers() []GlobalDNSServer {
+	servers := make([]GlobalDNSServer, 0, len(defaultProxyDNSNameservers))
+	for index, endpoint := range defaultProxyDNSNameservers {
+		protocol, address, port, path := parseDefaultDNSServerEndpoint(endpoint)
+		servers = append(servers, GlobalDNSServer{
+			ID:       fmt.Sprintf("dns-proxy-%d", index+1),
+			Name:     fmt.Sprintf("proxy-%d", index+1),
+			Role:     "proxy",
+			Protocol: protocol,
+			Address:  address,
+			Port:     port,
+			Path:     path,
+		})
+	}
+	return servers
+}
+
+func dnsServerMatchesEndpoint(server GlobalDNSServer, endpoint string) bool {
+	protocol, address, port, path := parseDefaultDNSServerEndpoint(endpoint)
+	return strings.TrimSpace(server.Protocol) == protocol &&
+		strings.TrimSpace(server.Address) == address &&
+		strings.TrimSpace(server.Port) == port &&
+		strings.TrimSpace(server.Path) == path
 }
 
 func (s *Store) writeGlobalConfig(config GlobalConfig) error {
@@ -1575,7 +1558,7 @@ func (s *Store) writeGlobalConfig(config GlobalConfig) error {
 	)
 }
 
-func (s *Store) deleteResource(kind ResourceKind, id string, afterDelete func(*State)) error {
+func (s *Store) deleteResource(kind ResourceKind, id string) error {
 	removed, err := s.deleteRepositoryResource(string(kind), id)
 	if err != nil {
 		return err
@@ -1583,16 +1566,7 @@ func (s *Store) deleteResource(kind ResourceKind, id string, afterDelete func(*S
 	if !removed {
 		return ErrNotFound
 	}
-	if afterDelete == nil {
-		return nil
-	}
-	state, err := s.readState()
-	if err != nil {
-		return err
-	}
-	afterDelete(&state)
-	state.UpdatedAt = time.Now().UTC()
-	return s.writeState(state)
+	return nil
 }
 
 func (s *Store) readRepositoryResource(kind string, id string, dst any) error {
@@ -2437,6 +2411,7 @@ func normalizeRuleSet(input RuleSetResource, current RuleSetResource) RuleSetRes
 	item.Name = chooseName(item.Name, current.Name, "Untitled rule set")
 	item.ID = item.Name
 	item.OriginType = chooseOrigin(item.OriginType, current.OriginType)
+	item.SupportedCores = uniqueCores(item.SupportedCores)
 	if current.CreatedAt.IsZero() {
 		item.CreatedAt = now
 	} else {
@@ -2566,7 +2541,7 @@ func normalizeManagedInbounds(input []ManagedInbound) []ManagedInbound {
 		inbound.Tun.Device = strings.TrimSpace(inbound.Tun.Device)
 		inbound.Tun.Stack = strings.TrimSpace(inbound.Tun.Stack)
 		inbound.Tun.Address = trimNonEmptyStrings(inbound.Tun.Address)
-		inbound.Tun.DNSHijack = trimNonEmptyStrings(inbound.Tun.DNSHijack)
+		inbound.Tun.DNSHijack = normalizeDNSHijackTargets(inbound.Tun.DNSHijack)
 		inbound.Tun.RouteAddress = trimNonEmptyStrings(inbound.Tun.RouteAddress)
 		inbound.Tun.RouteExcludeAddress = trimNonEmptyStrings(inbound.Tun.RouteExcludeAddress)
 		inbound.Tun.RouteAddressSet = trimNonEmptyStrings(inbound.Tun.RouteAddressSet)
@@ -2605,6 +2580,16 @@ func trimNonEmptyStrings(values []string) []string {
 	return result
 }
 
+func normalizeDNSHijackTargets(values []string) []string {
+	targets := trimNonEmptyStrings(values)
+	for index, target := range targets {
+		if target == "127.0.0.1:53" || target == "localhost:53" {
+			targets[index] = "any:53"
+		}
+	}
+	return targets
+}
+
 func chooseName(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -2641,6 +2626,23 @@ func chooseCore(input Core, current Core) Core {
 		return current
 	}
 	return CoreMihomo
+}
+
+func uniqueCores(values []Core) []Core {
+	if len(values) == 0 {
+		return nil
+	}
+	unique := make([]Core, 0, len(values))
+	for _, value := range values {
+		if value != CoreMihomo && value != CoreSingBox {
+			continue
+		}
+		if slices.Contains(unique, value) {
+			continue
+		}
+		unique = append(unique, value)
+	}
+	return unique
 }
 
 func uniqueStrings(values []string) []string {
