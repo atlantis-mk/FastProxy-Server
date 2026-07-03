@@ -2249,9 +2249,9 @@ func singBoxDefaultRouteRules(config ...repository.GlobalConfig) []map[string]an
 }
 
 func singBoxDefaultDomainResolver(config repository.GlobalConfig) map[string]any {
-	server := firstDNSServerNameByRole(config.DNSServers, "default")
+	server := firstSingBoxOutboundDomainResolverName(config.DNSServers, "default")
 	if server == "" {
-		server = firstDNSServerName(config.DNSServers)
+		server = firstSingBoxOutboundDomainResolverName(config.DNSServers, "")
 	}
 	if server == "" {
 		return nil
@@ -2668,6 +2668,35 @@ func firstDNSServerName(servers []repository.GlobalDNSServer) string {
 		}
 	}
 	return ""
+}
+
+func firstSingBoxOutboundDomainResolverName(servers []repository.GlobalDNSServer, role string) string {
+	for index, server := range servers {
+		if role != "" && strings.TrimSpace(server.Role) != role {
+			continue
+		}
+		if !singBoxDNSServerUsableForOutboundDomain(server) {
+			continue
+		}
+		if name := strings.TrimSpace(server.Name); name != "" {
+			return name
+		}
+		return fmt.Sprintf("%s-%d", server.Role, index+1)
+	}
+	return ""
+}
+
+func singBoxDNSServerUsableForOutboundDomain(server repository.GlobalDNSServer) bool {
+	protocol := strings.ToLower(strings.TrimSpace(server.Protocol))
+	address := strings.TrimSpace(server.Address)
+	if address == "" || protocol == "fakeip" || protocol == "system" {
+		return false
+	}
+	ip := net.ParseIP(address)
+	if ip == nil {
+		return true
+	}
+	return !ip.IsLoopback() && !ip.IsUnspecified() && !ip.IsLinkLocalUnicast()
 }
 
 func firstRenderableSingBoxDNSServerNameByRole(servers []repository.GlobalDNSServer, role string) string {

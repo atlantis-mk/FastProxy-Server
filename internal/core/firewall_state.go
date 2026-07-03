@@ -101,11 +101,13 @@ func CleanupRuntimeNetworkState(ctx context.Context) error {
 
 func cleanupRuntimeNetworkState(ctx context.Context, runner commandRunner) error {
 	var cleanupErr error
-	_, _ = runFirewallCommand(ctx, runner, "nft", []string{"delete", "table", "inet", "mihomo"}, nil)
-	if err := deleteMihomoFW4Rules(ctx, runner); err != nil {
+	for _, table := range []string{"mihomo", "sing-box"} {
+		_, _ = runFirewallCommand(ctx, runner, "nft", []string{"delete", "table", "inet", table}, nil)
+	}
+	if err := deleteRuntimeFW4Rules(ctx, runner); err != nil {
 		cleanupErr = errors.Join(cleanupErr, err)
 	}
-	for _, pref := range []string{"9000", "9001", "9002", "9010"} {
+	for _, pref := range []string{"1", "9000", "9001", "9002", "9010", "32768"} {
 		for range 8 {
 			if _, err := runFirewallCommand(ctx, runner, "ip", []string{"rule", "del", "pref", pref}, nil); err != nil {
 				break
@@ -119,14 +121,14 @@ func cleanupRuntimeNetworkState(ctx context.Context, runner commandRunner) error
 	return cleanupErr
 }
 
-func deleteMihomoFW4Rules(ctx context.Context, runner commandRunner) error {
+func deleteRuntimeFW4Rules(ctx context.Context, runner commandRunner) error {
 	var cleanupErr error
 	for _, chain := range []string{"input", "forward"} {
 		output, err := runFirewallCommand(ctx, runner, "nft", []string{"-a", "list", "chain", "inet", "fw4", chain}, nil)
 		if err != nil {
 			continue
 		}
-		for _, handle := range mihomoRuleHandles(string(output)) {
+		for _, handle := range runtimeRuleHandles(string(output)) {
 			if _, err := runFirewallCommand(ctx, runner, "nft", []string{"delete", "rule", "inet", "fw4", chain, "handle", handle}, nil); err != nil {
 				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete fw4 %s rule handle %s: %w", chain, handle, err))
 			}
@@ -135,11 +137,11 @@ func deleteMihomoFW4Rules(ctx context.Context, runner commandRunner) error {
 	return cleanupErr
 }
 
-func mihomoRuleHandles(rules string) []string {
+func runtimeRuleHandles(rules string) []string {
 	handlePattern := regexp.MustCompile(`# handle ([0-9]+)`)
 	var handles []string
 	for _, line := range strings.Split(rules, "\n") {
-		if !strings.Contains(line, "mihomo") {
+		if !strings.Contains(line, "mihomo") && !strings.Contains(line, "sing-box") {
 			continue
 		}
 		match := handlePattern.FindStringSubmatch(line)

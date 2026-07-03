@@ -1021,7 +1021,7 @@ func TestSingBoxRouteUsesGlobalRouteFields(t *testing.T) {
 			"dnsSingBoxClientSubnet":   "1.1.1.1/24",
 		},
 		DNSServers: []repository.GlobalDNSServer{
-			{Name: "default-1", Role: "default"},
+			{Name: "default-1", Role: "default", Address: "8.8.8.8"},
 		},
 	}, nil, nil, nil)
 
@@ -1046,7 +1046,7 @@ func TestSingBoxRouteFallsBackToFirstDNSResolver(t *testing.T) {
 	route := singBoxRoute(repository.GlobalConfig{
 		Fields: map[string]any{},
 		DNSServers: []repository.GlobalDNSServer{
-			{Name: "proxy-1", Role: "proxy"},
+			{Name: "proxy-1", Role: "proxy", Address: "1.1.1.1"},
 		},
 	}, nil, nil, nil)
 
