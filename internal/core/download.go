@@ -44,6 +44,7 @@ type UpdateInfo struct {
 	UpdateAvailable bool            `json:"updateAvailable"`
 	Cached          bool            `json:"cached"`
 	AssetName       string          `json:"assetName"`
+	AssetURL        string          `json:"assetUrl"`
 }
 
 type TokenProvider func() string
@@ -70,8 +71,14 @@ func ResolveBinary(ctx context.Context, dataDir string, core repository.Core, co
 	if strings.TrimSpace(configuredPath) != "" {
 		return strings.TrimSpace(configuredPath), nil
 	}
+	if systemPath, err := execLookPath(CoreBinaryName(core)); err == nil {
+		return systemPath, nil
+	}
 	if cache := CachedBinary(dataDir, core); cache.Exists {
 		return cache.Path, nil
+	}
+	if embeddedPath, err := installEmbeddedBinary(dataDir, core); err == nil {
+		return embeddedPath, nil
 	}
 	release, err := latestRelease(ctx, core)
 	if err != nil {
@@ -100,6 +107,7 @@ func CheckUpdate(ctx context.Context, dataDir string, core repository.Core) (Upd
 		UpdateAvailable: cache.Version != release.TagName,
 		Cached:          cache.Exists,
 		AssetName:       asset.Name,
+		AssetURL:        asset.URL,
 	}, nil
 }
 
@@ -126,14 +134,24 @@ func DownloadLatest(ctx context.Context, dataDir string, core repository.Core) (
 		UpdateAvailable: false,
 		Cached:          cache.Exists,
 		AssetName:       asset.Name,
+		AssetURL:        asset.URL,
 	}, nil
 }
 
 func InstallLocal(dataDir string, core repository.Core, filename string, reader io.Reader) (BinaryCache, error) {
+	return InstallLocalVersion(dataDir, core, filename, "", reader)
+}
+
+func InstallLocalVersion(dataDir string, core repository.Core, filename string, version string, reader io.Reader) (BinaryCache, error) {
 	if err := ValidateCore(core); err != nil {
 		return BinaryCache{}, err
 	}
-	version := "local-" + time.Now().UTC().Format("20060102-150405")
+	version = strings.TrimSpace(version)
+	if version == "" {
+		version = "local-" + time.Now().UTC().Format("20060102-150405")
+	} else if err := validateCacheVersion(version); err != nil {
+		return BinaryCache{}, err
+	}
 	dir := filepath.Join(dataDir, "cores", string(core), version)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return BinaryCache{}, err
@@ -162,6 +180,16 @@ func InstallLocal(dataDir string, core repository.Core, filename string, reader 
 		}
 	}
 	return BinaryCache{Path: binaryPath, Version: version, Exists: true}, nil
+}
+
+func validateCacheVersion(version string) error {
+	if version == "." || version == ".." || filepath.Base(version) != version {
+		return fmt.Errorf("invalid cache version %q", version)
+	}
+	if strings.ContainsAny(version, `/\`) {
+		return fmt.Errorf("invalid cache version %q", version)
+	}
+	return nil
 }
 
 func CachedBinary(dataDir string, core repository.Core) BinaryCache {

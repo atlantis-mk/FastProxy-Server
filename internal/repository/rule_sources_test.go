@@ -346,12 +346,15 @@ func TestRuleSourceRepositoryBrowserRefreshIndexMergesSingAndMetaBranches(t *tes
 	if !slices.Contains(requestedRefs, "sing-geo-sha") || !slices.Contains(requestedRefs, "meta-geo-sha") || !slices.Contains(requestedRefs, "sing-geo-lite-sha") {
 		t.Fatalf("requested refs = %#v, want geo and geo-lite directories to be fetched", requestedRefs)
 	}
-	if len(index.Entries) != 5 {
-		t.Fatalf("len(index.Entries) = %d, want 5", len(index.Entries))
+	if len(index.Entries) != 4 {
+		t.Fatalf("len(index.Entries) = %d, want 4", len(index.Entries))
 	}
 	byPath := map[string]RuleSourceIndexEntry{}
 	for _, entry := range index.Entries {
 		byPath[entry.LogicalPath] = entry
+	}
+	if _, ok := byPath["asn/AS1"]; ok {
+		t.Fatalf("asn/AS1 should be ignored")
 	}
 	geositeCN := byPath["geo/geosite/cn"]
 	if geositeCN.Files[CoreSingBox].Format != "binary" || geositeCN.Files[CoreMihomo].Format != "mrs" {
@@ -401,19 +404,55 @@ func TestRuleSourceRepositoryBrowserRefreshIndexUsesGitHubToken(t *testing.T) {
 	}
 }
 
-func TestStorePersistsRuleSourceIndexAndReturnsEmptyBuiltInIndex(t *testing.T) {
+func TestRuleSourceRepositoryBrowserRefreshIndexFallsBackToBuiltInSnapshot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	browser := NewRuleSourceRepositoryBrowser()
+	browser.client = server.Client()
+	browser.githubAPIBase = server.URL
+
+	index, err := browser.RefreshIndex(BuiltInRuleSourceRepositories()[0])
+	if err != nil {
+		t.Fatalf("RefreshIndex() error = %v", err)
+	}
+	if index.RepositoryID != "metacubex-meta-rules-dat" || len(index.Entries) == 0 {
+		t.Fatalf("fallback index = %#v, want built-in snapshot entries", index)
+	}
+	if index.Refs[CoreSingBox] != "sing" || index.Refs[CoreMihomo] != "meta" {
+		t.Fatalf("fallback refs = %#v, want sing and meta", index.Refs)
+	}
+}
+
+func TestStorePersistsRuleSourceIndexAndReturnsBuiltInSnapshot(t *testing.T) {
 	root := t.TempDir()
 	store, err := NewStore(root)
 	if err != nil {
 		t.Fatalf("NewStore() error = %v", err)
 	}
 
-	empty, err := store.GetRuleSourceIndex("metacubex-meta-rules-dat")
+	snapshot, err := store.GetRuleSourceIndex("metacubex-meta-rules-dat")
 	if err != nil {
-		t.Fatalf("GetRuleSourceIndex(empty built-in) error = %v", err)
+		t.Fatalf("GetRuleSourceIndex(snapshot built-in) error = %v", err)
 	}
-	if empty.RepositoryID != "metacubex-meta-rules-dat" || len(empty.Entries) != 0 {
-		t.Fatalf("empty index = %#v, want built-in metadata with no entries", empty)
+	if snapshot.RepositoryID != "metacubex-meta-rules-dat" || len(snapshot.Directories) == 0 {
+		t.Fatalf("snapshot index = %#v, want built-in snapshot directories", snapshot)
+	}
+	snapshotEntry, err := store.FindRuleSourceIndexEntry("metacubex-meta-rules-dat", "geo/geosite/cn")
+	if err != nil {
+		t.Fatalf("FindRuleSourceIndexEntry(snapshot) error = %v", err)
+	}
+	if snapshotEntry.Files[CoreSingBox].Path == "" || snapshotEntry.Files[CoreMihomo].Path == "" {
+		t.Fatalf("snapshot entry = %#v, want sing-box and mihomo files", snapshotEntry)
+	}
+	snapshotSearch, err := store.SearchRuleSourceIndex("metacubex-meta-rules-dat", "geo/geosite/cn", 10)
+	if err != nil {
+		t.Fatalf("SearchRuleSourceIndex(snapshot) error = %v", err)
+	}
+	if len(snapshotSearch.Entries) == 0 {
+		t.Fatalf("snapshot search = %#v, want at least one entry", snapshotSearch)
 	}
 
 	staleDir := filepath.Join(root, "repository", "rule-source-indexes", "metacubex-meta-rules-dat")

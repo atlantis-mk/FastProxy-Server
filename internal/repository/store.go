@@ -24,8 +24,8 @@ const configResourceKind = "_config"
 const globalConfigResourceID = "global"
 
 var defaultDNSNameservers = []string{
-	"119.29.29.29",
 	"223.5.5.5",
+	"119.29.29.29",
 	"tls://223.5.5.5:853",
 	"tls://223.6.6.6:853",
 	"tls://120.53.53.53",
@@ -33,8 +33,8 @@ var defaultDNSNameservers = []string{
 }
 
 var defaultProxyDNSNameservers = []string{
-	"https://1.1.1.1/dns-query",
 	"https://8.8.8.8/dns-query",
+	"https://1.1.1.1/dns-query",
 	"https://9.9.9.9/dns-query",
 }
 
@@ -663,6 +663,25 @@ func (s *Store) ListRuleSourceRepositories() ([]RuleSourceRepository, error) {
 	return s.listRuleSourceRepositories()
 }
 
+func (s *Store) QueryRuleSourceRepositories(offset int, limit int, query string) (RuleSourceRepositoryPage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items, err := s.listRuleSourceRepositories()
+	if err != nil {
+		return RuleSourceRepositoryPage{}, err
+	}
+	items = filterRuleSourceRepositories(items, query)
+	pageItems, nextOffset, hasMore := paginateSlice(items, offset, limit)
+	return RuleSourceRepositoryPage{
+		Items:      pageItems,
+		Offset:     normalizePageOffset(offset, len(items)),
+		Limit:      normalizePageLimit(limit, len(pageItems), len(items)),
+		Total:      len(items),
+		NextOffset: nextOffset,
+		HasMore:    hasMore,
+	}, nil
+}
+
 func (s *Store) GetRuleSourceRepository(id string) (RuleSourceRepository, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -732,15 +751,56 @@ func (s *Store) GetRuleSourceIndexPage(repositoryID string, requestedPath string
 	indexPath := normalizeRepositoryRootPath(requestedPath)
 	item, err := s.readRuleSourceIndexFromDB(repositoryID, indexPath, offset, limit)
 	if errors.Is(err, sql.ErrNoRows) {
-		repo, ok := builtInRuleSourceRepository(repositoryID)
-		if !ok {
-			return RuleSourceIndex{}, ErrNotFound
+		if index, ok := builtInRuleSourceIndexSnapshotPage(repositoryID, indexPath, offset, limit); ok {
+			return index, nil
 		}
-		return emptyRuleSourceIndex(repo, indexPath), nil
+		return emptyBuiltInRuleSourceIndex(repositoryID, indexPath)
 	}
 	if err != nil {
 		return RuleSourceIndex{}, err
 	}
+	return item, nil
+}
+
+func (s *Store) GetRuleSourceIndexFlatPage(repositoryID string, offset int, limit int) (RuleSourceIndex, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, err := s.readRuleSourceIndexMetadataFromDB(repositoryID, "")
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if index, ok := builtInRuleSourceIndexSnapshotFlatPage(repositoryID, offset, limit); ok {
+				return index, nil
+			}
+			return emptyBuiltInRuleSourceIndex(repositoryID, "")
+		}
+		return RuleSourceIndex{}, err
+	}
+	total, err := s.countAllRuleSourceIndexEntries(repositoryID)
+	if err != nil {
+		return RuleSourceIndex{}, err
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	if limit <= 0 {
+		limit = total
+	}
+	entries, err := s.listAllRuleSourceIndexEntriesPage(repositoryID, offset, limit)
+	if err != nil {
+		return RuleSourceIndex{}, err
+	}
+	nextOffset := offset + len(entries)
+	item.Path = ""
+	item.Directories = nil
+	item.Entries = entries
+	item.Offset = offset
+	item.Limit = limit
+	item.Total = total
+	item.NextOffset = nextOffset
+	item.HasMore = nextOffset < total
 	return item, nil
 }
 
@@ -750,9 +810,22 @@ func (s *Store) FindRuleSourceIndexEntry(repositoryID string, logicalPath string
 	logicalPath = normalizeRepositoryRootPath(logicalPath)
 	entry, err := s.readRuleSourceIndexEntryFromDB(repositoryID, logicalPath)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if entry, ok := builtInRuleSourceIndexSnapshotEntry(repositoryID, logicalPath); ok {
+				return entry, nil
+			}
+		}
 		return RuleSourceIndexEntry{}, convertNotFound(err)
 	}
 	return entry, nil
+}
+
+func emptyBuiltInRuleSourceIndex(repositoryID string, indexPath string) (RuleSourceIndex, error) {
+	repo, ok := builtInRuleSourceRepository(repositoryID)
+	if !ok {
+		return RuleSourceIndex{}, ErrNotFound
+	}
+	return emptyRuleSourceIndex(repo, indexPath), nil
 }
 
 func firstStringArg(values []string) string {
@@ -879,6 +952,11 @@ func (s *Store) SearchRuleSourceIndex(repositoryID string, query string, limit i
 	filter.Offset = queryOffset(filter.Offset)
 	root, err := s.readRuleSourceIndexMetadataFromDB(repositoryID, "")
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if index, ok := builtInRuleSourceIndexSnapshotSearch(repositoryID, query, limit, filter); ok {
+				return index, nil
+			}
+		}
 		return RuleSourceIndex{}, convertNotFound(err)
 	}
 	if query == "" && isEmptyRuleSourceIndexSearchFilter(filter) {
@@ -973,6 +1051,25 @@ func (s *Store) ListSingBoxRuleSets() ([]SingBoxRuleSetResource, error) {
 	return s.listSingBoxRuleSets()
 }
 
+func (s *Store) QuerySingBoxRuleSets(offset int, limit int, query string) (SingBoxRuleSetPage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items, err := s.listSingBoxRuleSets()
+	if err != nil {
+		return SingBoxRuleSetPage{}, err
+	}
+	items = filterSingBoxRuleSets(items, query)
+	pageItems, nextOffset, hasMore := paginateSlice(items, offset, limit)
+	return SingBoxRuleSetPage{
+		Items:      pageItems,
+		Offset:     normalizePageOffset(offset, len(items)),
+		Limit:      normalizePageLimit(limit, len(pageItems), len(items)),
+		Total:      len(items),
+		NextOffset: nextOffset,
+		HasMore:    hasMore,
+	}, nil
+}
+
 func (s *Store) GetSingBoxRuleSet(id string) (SingBoxRuleSetResource, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1027,6 +1124,25 @@ func (s *Store) ListMihomoRuleProviders() ([]MihomoRuleProviderResource, error) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.listMihomoRuleProviders()
+}
+
+func (s *Store) QueryMihomoRuleProviders(offset int, limit int, query string) (MihomoRuleProviderPage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items, err := s.listMihomoRuleProviders()
+	if err != nil {
+		return MihomoRuleProviderPage{}, err
+	}
+	items = filterMihomoRuleProviders(items, query)
+	pageItems, nextOffset, hasMore := paginateSlice(items, offset, limit)
+	return MihomoRuleProviderPage{
+		Items:      pageItems,
+		Offset:     normalizePageOffset(offset, len(items)),
+		Limit:      normalizePageLimit(limit, len(pageItems), len(items)),
+		Total:      len(items),
+		NextOffset: nextOffset,
+		HasMore:    hasMore,
+	}, nil
 }
 
 func (s *Store) GetMihomoRuleProvider(id string) (MihomoRuleProviderResource, error) {
@@ -1433,12 +1549,12 @@ func defaultGlobalInbounds() []ManagedInbound {
 			Kind:    "tun",
 			Tun: InboundTun{
 				Address:             []string{"172.19.0.1/30"},
-				InterfaceName:       "utun",
-				Device:              "utun",
+				InterfaceName:       "utun101",
+				Device:              "utun101",
 				Stack:               "system",
-				AutoRoute:           false,
-				AutoRedirect:        false,
-				AutoDetectInterface: false,
+				AutoRoute:           true,
+				AutoRedirect:        true,
+				AutoDetectInterface: true,
 				StrictRoute:         false,
 				DNSHijack:           []string{"any:53"},
 			},
@@ -1613,6 +1729,132 @@ func listResources[T interface{ GetUpdatedAt() time.Time }](s *Store, kind Resou
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+func paginateSlice[T any](items []T, offset int, limit int) ([]T, int, bool) {
+	total := len(items)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	if limit <= 0 {
+		limit = total
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	nextOffset := end
+	hasMore := end < total
+	return items[offset:end], nextOffset, hasMore
+}
+
+func matchesSearchQuery(query string, values ...string) bool {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return true
+	}
+	for _, value := range values {
+		if strings.Contains(strings.ToLower(strings.TrimSpace(value)), query) {
+			return true
+		}
+	}
+	return false
+}
+
+func filterRuleSourceRepositories(items []RuleSourceRepository, query string) []RuleSourceRepository {
+	if strings.TrimSpace(query) == "" {
+		return items
+	}
+	filtered := make([]RuleSourceRepository, 0, len(items))
+	for _, item := range items {
+		if matchesSearchQuery(
+			query,
+			item.ID,
+			item.Name,
+			item.Description,
+			item.Owner,
+			item.Repository,
+		) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
+func filterSingBoxRuleSets(items []SingBoxRuleSetResource, query string) []SingBoxRuleSetResource {
+	if strings.TrimSpace(query) == "" {
+		return items
+	}
+	filtered := make([]SingBoxRuleSetResource, 0, len(items))
+	for _, item := range items {
+		if matchesSearchQuery(
+			query,
+			item.ID,
+			item.Name,
+			item.Description,
+			item.Tag,
+			string(item.SourceMode),
+			item.RepositoryID,
+			item.Path,
+			item.URL,
+			item.LocalPath,
+			item.Format,
+			item.UpdateInterval,
+		) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
+func filterMihomoRuleProviders(items []MihomoRuleProviderResource, query string) []MihomoRuleProviderResource {
+	if strings.TrimSpace(query) == "" {
+		return items
+	}
+	filtered := make([]MihomoRuleProviderResource, 0, len(items))
+	for _, item := range items {
+		if matchesSearchQuery(
+			query,
+			item.ID,
+			item.Name,
+			item.Description,
+			item.Provider,
+			string(item.SourceMode),
+			item.RepositoryID,
+			item.Path,
+			item.URL,
+			item.LocalPath,
+			item.Behavior,
+			item.Format,
+			item.Interval,
+		) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
+func normalizePageOffset(offset int, total int) int {
+	if offset < 0 {
+		return 0
+	}
+	if offset > total {
+		return total
+	}
+	return offset
+}
+
+func normalizePageLimit(limit int, pageSize int, total int) int {
+	if limit > 0 {
+		return limit
+	}
+	if total == 0 {
+		return 0
+	}
+	return pageSize
 }
 
 func (s *Store) writeRepositoryResource(kind string, id string, name string, createdAt time.Time, updatedAt time.Time, value any) error {
@@ -2035,6 +2277,31 @@ func (s *Store) listAllRuleSourceIndexEntries(repositoryID string) ([]RuleSource
 	return scanRuleSourceIndexEntries(rows)
 }
 
+func (s *Store) countAllRuleSourceIndexEntries(repositoryID string) (int, error) {
+	var total int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*)
+		FROM rule_source_index_entries
+		WHERE repository_id = ?
+	`, repositoryID).Scan(&total)
+	return total, err
+}
+
+func (s *Store) listAllRuleSourceIndexEntriesPage(repositoryID string, offset int, limit int) ([]RuleSourceIndexEntry, error) {
+	rows, err := s.db.Query(`
+		SELECT logical_path, name, files_json
+		FROM rule_source_index_entries
+		WHERE repository_id = ?
+		ORDER BY logical_path
+		LIMIT ? OFFSET ?
+	`, repositoryID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanRuleSourceIndexEntries(rows)
+}
+
 func (s *Store) listRuleSourceSelectableFilesFromDB(repositoryID string, core Core) (RuleSourceSelectableFiles, error) {
 	root, err := s.readRuleSourceIndexMetadataFromDB(repositoryID, "")
 	if err != nil {
@@ -2411,7 +2678,7 @@ func normalizeRuleSet(input RuleSetResource, current RuleSetResource) RuleSetRes
 	item.Name = chooseName(item.Name, current.Name, "Untitled rule set")
 	item.ID = item.Name
 	item.OriginType = chooseOrigin(item.OriginType, current.OriginType)
-	item.SupportedCores = uniqueCores(item.SupportedCores)
+	item.SupportedCores = normalizeRuleSetSupportedCores(item.SupportedCores, item.Rules)
 	if current.CreatedAt.IsZero() {
 		item.CreatedAt = now
 	} else {
@@ -2419,6 +2686,57 @@ func normalizeRuleSet(input RuleSetResource, current RuleSetResource) RuleSetRes
 	}
 	item.UpdatedAt = now
 	return item
+}
+
+func normalizeRuleSetSupportedCores(input []Core, rules []NormalizedRule) []Core {
+	derived := supportedCoresFromRules(rules)
+	if len(derived) > 0 {
+		return derived
+	}
+	return uniqueCores(input)
+}
+
+func supportedCoresFromRules(rules []NormalizedRule) []Core {
+	if len(rules) == 0 {
+		return nil
+	}
+	supported := map[Core]bool{}
+	var walk func([]NormalizedRule, map[Core]bool)
+	walk = func(items []NormalizedRule, inheritedUnsupported map[Core]bool) {
+		for _, rule := range items {
+			unsupported := map[Core]bool{}
+			for core, value := range inheritedUnsupported {
+				unsupported[core] = value
+			}
+			for _, core := range rule.UnsupportedCores {
+				unsupported[core] = true
+			}
+			supported[CoreMihomo] = true
+			if !unsupported[CoreSingBox] {
+				supported[CoreSingBox] = true
+			}
+			if len(rule.Rules) > 0 {
+				walk(rule.Rules, unsupported)
+			}
+		}
+	}
+	walk(rules, nil)
+	result := []Core{}
+	for _, core := range []Core{CoreMihomo, CoreSingBox} {
+		if supported[core] {
+			result = append(result, core)
+		}
+	}
+	return result
+}
+
+func ruleUnsupportedForCore(rule NormalizedRule, core Core) bool {
+	for _, unsupported := range rule.UnsupportedCores {
+		if unsupported == core {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeGroupSet(input GroupSetResource, current GroupSetResource) GroupSetResource {

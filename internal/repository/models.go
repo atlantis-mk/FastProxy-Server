@@ -164,14 +164,17 @@ func (n *NormalizedNode) UnmarshalJSON(data []byte) error {
 }
 
 type NormalizedRule struct {
-	ID       string           `json:"id"`
-	Type     string           `json:"type,omitempty"`
-	Mode     string           `json:"mode,omitempty"`
-	Rules    []NormalizedRule `json:"rules,omitempty"`
-	Action   string           `json:"action,omitempty"`
-	Outbound string           `json:"outbound,omitempty"`
-	Fields   map[string]any   `json:"fields,omitempty"`
-	Raw      []string         `json:"raw,omitempty"`
+	ID                 string                      `json:"id"`
+	Type               string                      `json:"type,omitempty"`
+	Mode               string                      `json:"mode,omitempty"`
+	Rules              []NormalizedRule            `json:"rules,omitempty"`
+	Action             string                      `json:"action,omitempty"`
+	Outbound           string                      `json:"outbound,omitempty"`
+	Fields             map[string]any              `json:"fields,omitempty"`
+	Raw                []string                    `json:"raw,omitempty"`
+	MihomoRuleProvider *MihomoRuleProviderResource `json:"mihomoRuleProvider,omitempty"`
+	UnsupportedCores   []Core                      `json:"unsupportedCores,omitempty"`
+	UnsupportedReason  string                      `json:"unsupportedReason,omitempty"`
 }
 
 func (r NormalizedRule) MarshalJSON() ([]byte, error) {
@@ -199,18 +202,30 @@ func (r NormalizedRule) MarshalJSON() ([]byte, error) {
 	if len(r.Raw) > 0 {
 		payload["raw"] = r.Raw
 	}
+	if r.MihomoRuleProvider != nil {
+		payload["mihomoRuleProvider"] = r.MihomoRuleProvider
+	}
+	if len(r.UnsupportedCores) > 0 {
+		payload["unsupportedCores"] = r.UnsupportedCores
+	}
+	if r.UnsupportedReason != "" {
+		payload["unsupportedReason"] = r.UnsupportedReason
+	}
 	return json.Marshal(payload)
 }
 
 func (r *NormalizedRule) UnmarshalJSON(data []byte) error {
 	type ruleAlias struct {
-		ID       string           `json:"id"`
-		Type     string           `json:"type,omitempty"`
-		Mode     string           `json:"mode,omitempty"`
-		Rules    []NormalizedRule `json:"rules,omitempty"`
-		Action   string           `json:"action,omitempty"`
-		Outbound string           `json:"outbound,omitempty"`
-		Raw      []string         `json:"raw,omitempty"`
+		ID                 string                      `json:"id"`
+		Type               string                      `json:"type,omitempty"`
+		Mode               string                      `json:"mode,omitempty"`
+		Rules              []NormalizedRule            `json:"rules,omitempty"`
+		Action             string                      `json:"action,omitempty"`
+		Outbound           string                      `json:"outbound,omitempty"`
+		Raw                []string                    `json:"raw,omitempty"`
+		MihomoRuleProvider *MihomoRuleProviderResource `json:"mihomoRuleProvider,omitempty"`
+		UnsupportedCores   []Core                      `json:"unsupportedCores,omitempty"`
+		UnsupportedReason  string                      `json:"unsupportedReason,omitempty"`
 	}
 
 	var alias ruleAlias
@@ -230,6 +245,9 @@ func (r *NormalizedRule) UnmarshalJSON(data []byte) error {
 	delete(raw, "action")
 	delete(raw, "outbound")
 	delete(raw, "raw")
+	delete(raw, "mihomoRuleProvider")
+	delete(raw, "unsupportedCores")
+	delete(raw, "unsupportedReason")
 
 	r.ID = alias.ID
 	r.Type = alias.Type
@@ -239,6 +257,9 @@ func (r *NormalizedRule) UnmarshalJSON(data []byte) error {
 	r.Outbound = alias.Outbound
 	r.Fields = raw
 	r.Raw = alias.Raw
+	r.MihomoRuleProvider = alias.MihomoRuleProvider
+	r.UnsupportedCores = alias.UnsupportedCores
+	r.UnsupportedReason = alias.UnsupportedReason
 	return nil
 }
 
@@ -396,6 +417,15 @@ type OperationEventPage struct {
 	HasMore    bool             `json:"hasMore"`
 }
 
+type RuleSourceRepositoryPage struct {
+	Items      []RuleSourceRepository `json:"items"`
+	Offset     int                    `json:"offset"`
+	Limit      int                    `json:"limit"`
+	Total      int                    `json:"total"`
+	NextOffset int                    `json:"nextOffset"`
+	HasMore    bool                   `json:"hasMore"`
+}
+
 type RuleSetResource struct {
 	Metadata
 	SupportedCores []Core              `json:"supportedCores,omitempty"`
@@ -420,10 +450,13 @@ type RoutingRuleTargetUI struct {
 }
 
 type RoutingRuleLeafUI struct {
-	Condition string `json:"condition"`
-	ID        string `json:"id"`
-	Target    string `json:"target"`
-	Value     any    `json:"value"`
+	Condition         string          `json:"condition"`
+	ID                string          `json:"id"`
+	SourceRule        *NormalizedRule `json:"sourceRule,omitempty"`
+	Target            string          `json:"target"`
+	UnsupportedCores  []Core          `json:"unsupportedCores,omitempty"`
+	UnsupportedReason string          `json:"unsupportedReason,omitempty"`
+	Value             any             `json:"value"`
 }
 
 type RuleSourceRepositoryProvider string
@@ -558,6 +591,24 @@ type MihomoRuleProviderResource struct {
 	Behavior     string              `json:"behavior,omitempty"`
 	Format       string              `json:"format,omitempty"`
 	Interval     string              `json:"interval,omitempty"`
+}
+
+type SingBoxRuleSetPage struct {
+	Items      []SingBoxRuleSetResource `json:"items"`
+	Offset     int                      `json:"offset"`
+	Limit      int                      `json:"limit"`
+	Total      int                      `json:"total"`
+	NextOffset int                      `json:"nextOffset"`
+	HasMore    bool                     `json:"hasMore"`
+}
+
+type MihomoRuleProviderPage struct {
+	Items      []MihomoRuleProviderResource `json:"items"`
+	Offset     int                          `json:"offset"`
+	Limit      int                          `json:"limit"`
+	Total      int                          `json:"total"`
+	NextOffset int                          `json:"nextOffset"`
+	HasMore    bool                         `json:"hasMore"`
 }
 
 type GroupSetResource struct {

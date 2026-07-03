@@ -2,8 +2,11 @@ package importer
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/atlantis-mk/FastProxy-Server/internal/repository"
 )
@@ -127,6 +130,293 @@ rules:
 		len(bootstrap.MihomoRuleProviders) != 0 ||
 		len(routingRuleSets) != 1 {
 		t.Fatalf("unexpected repository counts: %+v", bootstrap)
+	}
+}
+
+func TestParseSubconverterINIMarksUnmatchedRemoteRuleSetSingBoxUnsupported(t *testing.T) {
+	content := `
+[custom]
+ruleset=🎯 全球直连,https://example.com/direct.list
+ruleset=🎯 全球直连,[]GEOIP,CN
+ruleset=🐟 漏网之鱼,[]FINAL
+custom_proxy_group=🎯 全球直连` + "`select`[]DIRECT`[]🚀 节点选择" + `
+custom_proxy_group=🐟 漏网之鱼` + "`select`[]🚀 节点选择`[]DIRECT" + `
+`
+	normalized, diagnostics, err := ParseClashContent(content)
+	if err != nil {
+		t.Fatalf("ParseClashContentWithRuleListResolver() error = %v", err)
+	}
+	if len(diagnostics.Warnings) == 0 {
+		t.Fatalf("diagnostics should include sing-box unsupported warning")
+	}
+	if len(normalized.Groups) != 2 {
+		t.Fatalf("len(normalized.Groups) = %d, want 2", len(normalized.Groups))
+	}
+	if normalized.Groups[0].Tag != "🎯 全球直连" || !reflect.DeepEqual(normalized.Groups[0].Outbounds, []string{"DIRECT", "🚀 节点选择"}) {
+		t.Fatalf("first group = %+v", normalized.Groups[0])
+	}
+	if len(normalized.Rules) != 3 {
+		t.Fatalf("len(normalized.Rules) = %d, want 3: %+v", len(normalized.Rules), normalized.Rules)
+	}
+	directRule := normalized.Rules[0]
+	if directRule.Outbound != "🎯 全球直连" {
+		t.Fatalf("directRule = %+v, want remote ruleset rule", directRule)
+	}
+	if len(directRule.Raw) != 1 || directRule.MihomoRuleProvider == nil {
+		t.Fatalf("directRule should keep mihomo RULE-SET raw/provider: %+v", directRule)
+	}
+	if directRule.Raw[0] != "RULE-SET,"+directRule.MihomoRuleProvider.Provider+",🎯 全球直连" {
+		t.Fatalf("directRule.Raw = %#v, provider = %+v", directRule.Raw, directRule.MihomoRuleProvider)
+	}
+	if directRule.MihomoRuleProvider.URL != "https://example.com/direct.list" || directRule.MihomoRuleProvider.Behavior != "classical" {
+		t.Fatalf("directRule provider = %+v", directRule.MihomoRuleProvider)
+	}
+	if len(directRule.Fields) != 0 {
+		t.Fatalf("directRule.Fields = %#v, want none for unmatched sing-box ruleset", directRule.Fields)
+	}
+	if !reflect.DeepEqual(directRule.UnsupportedCores, []repository.Core{repository.CoreSingBox}) {
+		t.Fatalf("directRule.UnsupportedCores = %#v, want sing-box", directRule.UnsupportedCores)
+	}
+	if directRule.UnsupportedReason == "" {
+		t.Fatalf("directRule.UnsupportedReason is empty")
+	}
+	geoRule := normalized.Rules[1]
+	if !reflect.DeepEqual(geoRule.Fields["geoip"], []string{"CN"}) || geoRule.Outbound != "🎯 全球直连" {
+		t.Fatalf("geoRule = %+v", geoRule)
+	}
+	matchRule := normalized.Rules[2]
+	if len(matchRule.Fields) != 0 || matchRule.Outbound != "🐟 漏网之鱼" {
+		t.Fatalf("matchRule = %+v", matchRule)
+	}
+}
+
+func TestExpandRemoteRuleSetContentAddsOutbound(t *testing.T) {
+	rules, warnings := expandRemoteRuleSetContent(`
+# comment
+payload:
+  - DOMAIN-SUFFIX,example.com
+  - DOMAIN-KEYWORD,youtube
+  - IP-CIDR,1.1.1.0/24,no-resolve
+`, "Proxy")
+	if len(warnings) != 1 || warnings[0] != "no-resolve was ignored during sing-box conversion" {
+		t.Fatalf("warnings = %#v, want no-resolve warning", warnings)
+	}
+	if len(rules) != 1 {
+		t.Fatalf("len(rules) = %d, want merged destination rule: %+v", len(rules), rules)
+	}
+	rule := rules[0]
+	if rule.Outbound != "Proxy" {
+		t.Fatalf("rule.Outbound = %q, want Proxy", rule.Outbound)
+	}
+	if !reflect.DeepEqual(rule.Fields["domain_suffix"], []string{"example.com"}) {
+		t.Fatalf("domain_suffix = %#v", rule.Fields["domain_suffix"])
+	}
+	if !reflect.DeepEqual(rule.Fields["domain_keyword"], []string{"youtube"}) {
+		t.Fatalf("domain_keyword = %#v", rule.Fields["domain_keyword"])
+	}
+	if !reflect.DeepEqual(rule.Fields["ip_cidr"], []string{"1.1.1.0/24"}) {
+		t.Fatalf("ip_cidr = %#v", rule.Fields["ip_cidr"])
+	}
+}
+
+func TestImportClashExpandsUnmatchedRemoteRuleSetForSingBox(t *testing.T) {
+	ruleListServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`
+DOMAIN-SUFFIX,example.com
+DOMAIN-KEYWORD,youtube
+`))
+	}))
+	t.Cleanup(ruleListServer.Close)
+
+	store, err := repository.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	result, err := NewService(store).ImportClash(ClashImportInput{
+		Name: "Expanded",
+		Content: `
+[custom]
+ruleset=Proxy,` + ruleListServer.URL + `/custom.list
+custom_proxy_group=Proxy` + "`select`[]DIRECT" + `
+`,
+	})
+	if err != nil {
+		t.Fatalf("ImportClash() error = %v", err)
+	}
+	if result.RuleSet == nil || len(result.RuleSet.Rules) != 1 {
+		t.Fatalf("rules = %#v, want one expanded merged rule", result.RuleSet)
+	}
+	rule := result.RuleSet.Rules[0]
+	if rule.MihomoRuleProvider != nil || len(rule.UnsupportedCores) != 0 {
+		t.Fatalf("expanded rule should not keep provider or unsupported marker: %+v", rule)
+	}
+	if !reflect.DeepEqual(rule.Fields["domain_suffix"], []string{"example.com"}) {
+		t.Fatalf("domain_suffix = %#v", rule.Fields["domain_suffix"])
+	}
+	if !reflect.DeepEqual(rule.Fields["domain_keyword"], []string{"youtube"}) {
+		t.Fatalf("domain_keyword = %#v", rule.Fields["domain_keyword"])
+	}
+	if len(result.Diagnostics.Warnings) == 0 {
+		t.Fatalf("warnings should mention expansion")
+	}
+}
+
+func stubSingBoxBuiltInRuleSetMatcher(names ...string) singBoxBuiltInRuleSetMatcher {
+	allowed := map[string]bool{}
+	for _, name := range names {
+		allowed[name] = true
+	}
+	return func(name string) string {
+		if allowed[name] {
+			return "geo/geosite/" + name
+		}
+		return ""
+	}
+}
+
+func TestParseSubconverterINIMatchesYouTubeURLToSingBoxBuiltInRuleSet(t *testing.T) {
+	content := `
+[custom]
+ruleset=📹 油管视频,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/YouTube.list
+custom_proxy_group=📹 油管视频` + "`select`[]🚀 节点选择`[]DIRECT" + `
+`
+	normalized, diagnostics, err := parseClashContent(content, stubSingBoxBuiltInRuleSetMatcher("youtube"), nil)
+	if err != nil {
+		t.Fatalf("ParseClashContentWithRuleListResolver() error = %v", err)
+	}
+	if len(diagnostics.Warnings) != 0 {
+		t.Fatalf("diagnostics.Warnings = %#v, want none", diagnostics.Warnings)
+	}
+	if len(normalized.Rules) != 1 {
+		t.Fatalf("len(normalized.Rules) = %d, want 1", len(normalized.Rules))
+	}
+	rule := normalized.Rules[0]
+	if rule.Outbound != "📹 油管视频" || rule.MihomoRuleProvider == nil {
+		t.Fatalf("rule = %+v", rule)
+	}
+	if !reflect.DeepEqual(rule.Fields["rule_set"], []string{"geo/geosite/youtube"}) {
+		t.Fatalf("rule_set = %#v, want geo/geosite/youtube", rule.Fields["rule_set"])
+	}
+	if rule.Raw[0] != "RULE-SET,"+rule.MihomoRuleProvider.Provider+",📹 油管视频" {
+		t.Fatalf("rule.Raw = %#v, provider = %+v", rule.Raw, rule.MihomoRuleProvider)
+	}
+}
+
+func TestParseSubconverterINIMatchesGoogleCNURLToSingBoxBuiltInRuleSet(t *testing.T) {
+	content := `
+[custom]
+ruleset=🎯 全球直连,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/GoogleCN.list
+custom_proxy_group=🎯 全球直连` + "`select`[]DIRECT`[]🚀 节点选择" + `
+`
+	normalized, diagnostics, err := parseClashContent(content, stubSingBoxBuiltInRuleSetMatcher("google-cn"), nil)
+	if err != nil {
+		t.Fatalf("ParseClashContent() error = %v", err)
+	}
+	if len(diagnostics.Warnings) != 0 {
+		t.Fatalf("diagnostics.Warnings = %#v, want none", diagnostics.Warnings)
+	}
+	if len(normalized.Rules) != 1 {
+		t.Fatalf("len(normalized.Rules) = %d, want 1", len(normalized.Rules))
+	}
+	rule := normalized.Rules[0]
+	if !reflect.DeepEqual(rule.Fields["rule_set"], []string{"geo/geosite/google-cn"}) {
+		t.Fatalf("rule_set = %#v, want geo/geosite/google-cn", rule.Fields["rule_set"])
+	}
+	if rule.UnsupportedCores != nil {
+		t.Fatalf("rule.UnsupportedCores = %#v, want nil", rule.UnsupportedCores)
+	}
+}
+
+func TestImportClashMatchesSubconverterRuleSetFromRuleSourceIndex(t *testing.T) {
+	store, err := repository.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	if _, err := store.UpsertRuleSourceIndex(repository.RuleSourceIndex{
+		RepositoryID: "metacubex-meta-rules-dat",
+		Owner:        "MetaCubeX",
+		Repository:   "meta-rules-dat",
+		Refs: map[repository.Core]string{
+			repository.CoreSingBox: "main",
+		},
+		RefreshedAt: time.Now(),
+		Entries: []repository.RuleSourceIndexEntry{{
+			LogicalPath: "geo/geosite/google-cn",
+			Name:        "google-cn",
+			Files: map[repository.Core]repository.RuleSourceIndexFile{
+				repository.CoreSingBox: {
+					Core:        repository.CoreSingBox,
+					Path:        "geo/geosite/google-cn.srs",
+					LogicalPath: "geo/geosite/google-cn",
+					Name:        "google-cn",
+					Kind:        repository.KindSingBoxRuleSet,
+					Format:      "binary",
+				},
+			},
+		}},
+	}); err != nil {
+		t.Fatalf("UpsertRuleSourceIndex() error = %v", err)
+	}
+
+	result, err := NewService(store).ImportClash(ClashImportInput{
+		Name: "ACL4SSR",
+		Content: `
+[custom]
+ruleset=🎯 全球直连,https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/GoogleCN.list
+custom_proxy_group=🎯 全球直连` + "`select`[]DIRECT`[]🚀 节点选择" + `
+`,
+	})
+	if err != nil {
+		t.Fatalf("ImportClash() error = %v", err)
+	}
+	if result.RuleSet == nil || len(result.RuleSet.Rules) != 1 {
+		t.Fatalf("imported rules = %#v, want one rule", result.RuleSet)
+	}
+	rule := result.RuleSet.Rules[0]
+	if !reflect.DeepEqual(rule.Fields["rule_set"], []string{"geo/geosite/google-cn"}) {
+		t.Fatalf("rule_set = %#v, want geo/geosite/google-cn", rule.Fields["rule_set"])
+	}
+	if rule.UnsupportedCores != nil {
+		t.Fatalf("UnsupportedCores = %#v, want nil", rule.UnsupportedCores)
+	}
+}
+
+func TestSubconverterSingBoxBuiltInRuleSetTagIgnoresSeparatorsButPreservesBang(t *testing.T) {
+	matcher := stubSingBoxBuiltInRuleSetMatcher("google-cn", "google-fcm", "steam-cn", "youtube", "anker@!cn")
+	tests := map[string]string{
+		"https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/GoogleFCM.list": "geo/geosite/google-fcm",
+		"https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/GoogleCN.list":          "geo/geosite/google-cn",
+		"https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/SteamCN.list":   "geo/geosite/steam-cn",
+		"https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/YouTube.list":   "geo/geosite/youtube",
+		"https://example.com/rules/anker@!cn.list":                                              "geo/geosite/anker@!cn",
+	}
+	for source, expected := range tests {
+		if actual := subconverterSingBoxBuiltInRuleSetTag(source, matcher); actual != expected {
+			t.Fatalf("subconverterSingBoxBuiltInRuleSetTag(%q) = %q, want %q", source, actual, expected)
+		}
+	}
+}
+
+func TestNormalizeRuleSetAliasKeyPreservesBangSemantic(t *testing.T) {
+	if actual := normalizeRuleSetAliasKey("anker@!cn"); actual != "anker-!cn" {
+		t.Fatalf("normalizeRuleSetAliasKey(anker@!cn) = %q, want anker-!cn", actual)
+	}
+	if actual := normalizeRuleSetAliasKey("anker@cn"); actual != "anker-cn" {
+		t.Fatalf("normalizeRuleSetAliasKey(anker@cn) = %q, want anker-cn", actual)
+	}
+}
+
+func TestSubconverterRuleSourceBaseNameUsesLastPathSegmentAndDropsSuffix(t *testing.T) {
+	tests := map[string]string{
+		"https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/GoogleFCM.list": "GoogleFCM",
+		"https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/GoogleCN.list":          "GoogleCN",
+		"https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/Ruleset/SteamCN.list":   "SteamCN",
+		"https://example.com/rules/Example.srs":                                                 "Example",
+	}
+	for source, expected := range tests {
+		if actual := subconverterRuleSourceBaseName(source); actual != expected {
+			t.Fatalf("subconverterRuleSourceBaseName(%q) = %q, want %q", source, actual, expected)
+		}
 	}
 }
 

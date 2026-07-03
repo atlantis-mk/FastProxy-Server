@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -16,11 +17,13 @@ import (
 )
 
 type Supervisor struct {
-	mu     sync.Mutex
-	logger *slog.Logger
-	cmd    *exec.Cmd
-	status RuntimeStatus
-	logs   []LogEntry
+	mu               sync.Mutex
+	logger           *slog.Logger
+	cmd              *exec.Cmd
+	cmdDone          chan struct{}
+	status           RuntimeStatus
+	logs             []LogEntry
+	firewallSnapshot *FirewallSnapshot
 }
 
 type RuntimeStatus struct {
@@ -47,6 +50,11 @@ func (s *Supervisor) Status() RuntimeStatus {
 }
 
 func (s *Supervisor) Start(ctx context.Context, adapter Adapter, binaryPath string, configPath string, runtime RuntimeConfig) error {
+	firewallSnapshot, err := CaptureFirewallSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	if s.cmd != nil && s.cmd.Process != nil {
 		s.mu.Unlock()
@@ -58,6 +66,7 @@ func (s *Supervisor) Start(ctx context.Context, adapter Adapter, binaryPath stri
 		return errors.New("core binary path is not configured")
 	}
 	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Dir = filepath.Dir(configPath)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		s.mu.Unlock()
@@ -73,19 +82,22 @@ func (s *Supervisor) Start(ctx context.Context, adapter Adapter, binaryPath stri
 		return err
 	}
 	now := time.Now().UTC()
+	done := make(chan struct{})
 	s.cmd = cmd
+	s.cmdDone = done
+	s.firewallSnapshot = firewallSnapshot
 	s.setStatusLocked(RuntimeStatus{Core: adapter.Core(), State: "starting", StartedAt: &now})
 	s.mu.Unlock()
 
 	go s.capture("stdout", stdout)
 	go s.capture("stderr", stderr)
-	go s.wait(cmd)
+	go s.wait(cmd, done)
 
 	deadline, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := adapter.HealthCheck(deadline, runtime); err != nil {
 		failure := fmt.Errorf("health check failed: %w", err)
-		s.stopAfterStartFailure(adapter.Core(), failure)
+		s.stopAfterStartFailure(ctx, adapter.Core(), failure)
 		return failure
 	}
 	s.setRunning(adapter.Core())
@@ -95,23 +107,41 @@ func (s *Supervisor) Start(ctx context.Context, adapter Adapter, binaryPath stri
 func (s *Supervisor) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	cmd := s.cmd
+	done := s.cmdDone
+	firewallSnapshot := s.firewallSnapshot
 	if cmd == nil || cmd.Process == nil {
 		s.setStatusLocked(RuntimeStatus{State: "stopped"})
 		s.mu.Unlock()
-		return nil
+		return s.restoreFirewallState(firewallSnapshot)
 	}
+	status := s.status
+	status.State = "stopping"
+	status.Error = ""
+	s.setStatusLocked(status)
 	s.mu.Unlock()
 
-	_ = ctx
-	if err := cmd.Process.Kill(); err != nil {
+	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return err
 	}
 
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	s.mu.Lock()
-	s.cmd = nil
-	s.setStatusLocked(RuntimeStatus{State: "stopped"})
+	if s.cmd == cmd {
+		s.cmd = nil
+		s.cmdDone = nil
+		s.setStatusLocked(RuntimeStatus{State: "stopped"})
+	} else if s.status.State == "stopping" {
+		s.setStatusLocked(RuntimeStatus{State: "stopped"})
+	}
 	s.mu.Unlock()
-	return nil
+	return s.restoreFirewallState(firewallSnapshot)
 }
 
 func (s *Supervisor) Restart(ctx context.Context, adapter Adapter, binaryPath string, configPath string, runtime RuntimeConfig) error {
@@ -138,13 +168,15 @@ func (s *Supervisor) writeConsoleLog(entry LogEntry) {
 	_, _ = fmt.Fprintln(os.Stdout, entry.Message)
 }
 
-func (s *Supervisor) wait(cmd *exec.Cmd) {
+func (s *Supervisor) wait(cmd *exec.Cmd, done chan struct{}) {
+	defer close(done)
 	err := cmd.Wait()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cmd == cmd {
 		s.cmd = nil
-		if err != nil {
+		s.cmdDone = nil
+		if err != nil && s.status.State != "stopping" {
 			status := s.status
 			status.State = "failed"
 			status.Error = err.Error()
@@ -164,19 +196,28 @@ func (s *Supervisor) appendLog(entry LogEntry) {
 	}
 }
 
-func (s *Supervisor) stopAfterStartFailure(core repository.Core, failure error) {
+func (s *Supervisor) stopAfterStartFailure(ctx context.Context, core repository.Core, failure error) {
 	s.mu.Lock()
 	cmd := s.cmd
+	done := s.cmdDone
+	firewallSnapshot := s.firewallSnapshot
 	s.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
+		if err := cmd.Process.Kill(); (err == nil || errors.Is(err, os.ErrProcessDone)) && done != nil {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
+		}
 	}
 	s.mu.Lock()
 	if s.cmd == cmd {
 		s.cmd = nil
+		s.cmdDone = nil
 	}
 	s.setStatusLocked(RuntimeStatus{Core: core, State: "failed", Error: failure.Error()})
 	s.mu.Unlock()
+	_ = s.restoreFirewallState(firewallSnapshot)
 }
 
 func (s *Supervisor) setRunning(core repository.Core) {
@@ -191,4 +232,25 @@ func (s *Supervisor) setRunning(core repository.Core) {
 
 func (s *Supervisor) setStatusLocked(status RuntimeStatus) {
 	s.status = status
+}
+
+func (s *Supervisor) restoreFirewallState(snapshot *FirewallSnapshot) error {
+	restoreCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var err error
+	if snapshot != nil {
+		err = snapshot.Restore(restoreCtx)
+	} else {
+		err = CleanupRuntimeNetworkState(restoreCtx)
+	}
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if s.firewallSnapshot == snapshot {
+		s.firewallSnapshot = nil
+	}
+	s.mu.Unlock()
+	return nil
 }

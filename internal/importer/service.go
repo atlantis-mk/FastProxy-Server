@@ -1,14 +1,19 @@
 package importer
 
 import (
+	"crypto/sha1"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/atlantis-mk/FastProxy-Server/internal/repository"
 	"gopkg.in/yaml.v3"
@@ -41,6 +46,16 @@ type ManualNodeDeleteInput struct {
 	Tag  string `json:"tag"`
 }
 
+type RemoteRuleSetExpandInput struct {
+	Source   string `json:"source"`
+	Outbound string `json:"outbound"`
+}
+
+type RemoteRuleSetExpandResult struct {
+	Rules    []repository.NormalizedRule `json:"rules,omitempty"`
+	Warnings []string                    `json:"warnings,omitempty"`
+}
+
 type Result struct {
 	Diagnostics  Diagnostics                      `json:"diagnostics"`
 	Subscription *repository.SubscriptionResource `json:"subscription,omitempty"`
@@ -53,11 +68,18 @@ type Service struct {
 	store *repository.Store
 }
 
+type singBoxBuiltInRuleSetMatcher func(source string) string
+type remoteRuleSetExpander func(source string, outbound string) ([]repository.NormalizedRule, []string)
+
 func NewService(store *repository.Store) *Service {
 	return &Service{store: store}
 }
 
 func ParseClashContent(content string) (repository.NormalizedConfig, Diagnostics, error) {
+	return parseClashContent(content, nil, nil)
+}
+
+func parseClashContent(content string, matcher singBoxBuiltInRuleSetMatcher, expander remoteRuleSetExpander) (repository.NormalizedConfig, Diagnostics, error) {
 	if strings.TrimSpace(content) == "" {
 		return repository.NormalizedConfig{}, Diagnostics{}, fmt.Errorf("%w: content is required", ErrInvalidImport)
 	}
@@ -70,9 +92,15 @@ func ParseClashContent(content string) (repository.NormalizedConfig, Diagnostics
 
 	var payload clashPayload
 	if err := yaml.Unmarshal([]byte(content), &payload); err != nil {
+		if looksLikeSubconverterINI(content) {
+			return parseSubconverterINI(content, matcher, expander)
+		}
 		return repository.NormalizedConfig{}, Diagnostics{}, fmt.Errorf("%w: %s", ErrInvalidImport, err)
 	}
 	if len(payload.Proxies) == 0 && len(payload.ProxyGroups) == 0 && len(payload.Rules) == 0 {
+		if looksLikeSubconverterINI(content) {
+			return parseSubconverterINI(content, matcher, expander)
+		}
 		return repository.NormalizedConfig{}, Diagnostics{}, fmt.Errorf("%w: no supported clash resources found", ErrInvalidImport)
 	}
 
@@ -102,7 +130,7 @@ func ParseClashContent(content string) (repository.NormalizedConfig, Diagnostics
 }
 
 func (s *Service) ImportClash(input ClashImportInput) (Result, error) {
-	normalized, diagnostics, err := ParseClashContent(input.Content)
+	normalized, diagnostics, err := parseClashContent(input.Content, s.matchSubconverterSingBoxBuiltInRuleSet, s.expandRemoteRuleSet)
 	if err != nil {
 		return Result{}, err
 	}
@@ -171,6 +199,72 @@ func (s *Service) ImportClash(input ClashImportInput) (Result, error) {
 		GroupSet:     &groupSet,
 		RuleSet:      &ruleSet,
 	}, nil
+}
+
+func (s *Service) matchSubconverterSingBoxBuiltInRuleSet(candidate string) string {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" || s == nil || s.store == nil {
+		return ""
+	}
+	entry, err := s.store.FindRuleSourceIndexEntry("metacubex-meta-rules-dat", "geo/geosite/"+candidate)
+	if err != nil {
+		return ""
+	}
+	if _, ok := entry.Files[repository.CoreSingBox]; !ok {
+		return ""
+	}
+	return "geo/geosite/" + candidate
+}
+
+func (s *Service) expandRemoteRuleSet(source string, outbound string) ([]repository.NormalizedRule, []string) {
+	content, err := downloadRemoteRuleSet(source)
+	if err != nil {
+		return nil, []string{fmt.Sprintf("remote ruleset %q expansion failed: %v", source, err)}
+	}
+	rules, warnings := expandRemoteRuleSetContent(content, outbound)
+	if len(rules) == 0 && len(warnings) == 0 {
+		warnings = append(warnings, fmt.Sprintf("remote ruleset %q expansion produced no supported rules", source))
+	}
+	return rules, warnings
+}
+
+func (s *Service) ExpandRemoteRuleSet(input RemoteRuleSetExpandInput) (RemoteRuleSetExpandResult, error) {
+	source := strings.TrimSpace(input.Source)
+	outbound := normalizeClashRuleOutbound(input.Outbound)
+	if source == "" || outbound == "" {
+		return RemoteRuleSetExpandResult{}, fmt.Errorf("%w: source and outbound are required", ErrInvalidImport)
+	}
+	rules, warnings := s.expandRemoteRuleSet(source, outbound)
+	return RemoteRuleSetExpandResult{
+		Rules:    rules,
+		Warnings: warnings,
+	}, nil
+}
+
+func downloadRemoteRuleSet(source string) (string, error) {
+	requestURL := strings.TrimSpace(source)
+	if requestURL == "" {
+		return "", fmt.Errorf("source url is empty")
+	}
+	req, err := http.NewRequest(http.MethodGet, requestURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "FastProxy")
+	client := http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
 }
 
 func (s *Service) ImportPlainNodes(input PlainNodeImportInput) (Result, error) {
@@ -529,6 +623,416 @@ func normalizeClashRules(lines []string) ([]repository.NormalizedRule, []string)
 		result = append(result, rule)
 	}
 	return result, warnings
+}
+
+func expandRemoteRuleSetContent(content string, outbound string) ([]repository.NormalizedRule, []string) {
+	lines := []string{}
+	warnings := []string{}
+	for lineNumber, rawLine := range strings.Split(content, "\n") {
+		line, ok := normalizeRemoteRuleSetLine(rawLine, outbound)
+		if !ok {
+			continue
+		}
+		if line == "" {
+			continue
+		}
+		lines = append(lines, line)
+		if len(lines) >= 20000 {
+			warnings = append(warnings, fmt.Sprintf("remote ruleset expansion stopped at line %d because rule count exceeded 20000", lineNumber+1))
+			break
+		}
+	}
+	rules, ruleWarnings := normalizeClashRules(lines)
+	warnings = append(warnings, ruleWarnings...)
+	return rules, warnings
+}
+
+func normalizeRemoteRuleSetLine(rawLine string, outbound string) (string, bool) {
+	line := strings.TrimSpace(rawLine)
+	if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+		return "", false
+	}
+	line = strings.TrimPrefix(line, "-")
+	line = strings.TrimSpace(strings.Trim(line, `"'`))
+	if line == "" || strings.EqualFold(line, "payload:") || strings.HasSuffix(line, ":") {
+		return "", false
+	}
+	if index := strings.Index(line, "#"); index >= 0 {
+		line = strings.TrimSpace(line[:index])
+	}
+	if index := strings.Index(line, ";"); index >= 0 {
+		line = strings.TrimSpace(line[:index])
+	}
+	if line == "" {
+		return "", false
+	}
+	parts := splitTopLevel(line, ',')
+	if len(parts) == 0 {
+		return "", false
+	}
+	ruleType := strings.ToUpper(strings.TrimSpace(parts[0]))
+	switch ruleType {
+	case "FINAL":
+		return "MATCH," + outbound, true
+	case "MATCH":
+		return "MATCH," + outbound, true
+	case "AND", "OR", "NOT":
+		if len(parts) >= 3 {
+			return line, true
+		}
+		return strings.Join(append(parts, outbound), ","), true
+	default:
+		if len(parts) < 2 {
+			return "", false
+		}
+		if len(parts) >= 3 && isKnownOutboundLike(parts[2]) {
+			return line, true
+		}
+		return strings.Join(append([]string{parts[0], parts[1], outbound}, parts[2:]...), ","), true
+	}
+}
+
+func isKnownOutboundLike(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	switch strings.ToLower(value) {
+	case "no-resolve", "src":
+		return false
+	default:
+		return true
+	}
+}
+
+func looksLikeSubconverterINI(content string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, ";") || strings.HasPrefix(line, "#") {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if lower == "[custom]" || strings.HasPrefix(lower, "ruleset=") || strings.HasPrefix(lower, "custom_proxy_group=") {
+			return true
+		}
+	}
+	return false
+}
+
+func parseSubconverterINI(content string, matcher singBoxBuiltInRuleSetMatcher, expander remoteRuleSetExpander) (repository.NormalizedConfig, Diagnostics, error) {
+	normalized := repository.NormalizedConfig{
+		Groups: []repository.NormalizedGroup{},
+		Rules:  []repository.NormalizedRule{},
+	}
+	diagnostics := Diagnostics{}
+
+	for lineNumber, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, ";") || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "custom_proxy_group":
+			group, warning, ok := parseSubconverterProxyGroup(value)
+			if warning != "" {
+				diagnostics.Warnings = append(diagnostics.Warnings, fmt.Sprintf("line %d: %s", lineNumber+1, warning))
+			}
+			if ok {
+				normalized.Groups = append(normalized.Groups, group)
+			}
+		case "ruleset":
+			rules, warnings := parseSubconverterRuleSet(value, matcher, expander)
+			normalized.Rules = append(normalized.Rules, rules...)
+			for _, warning := range warnings {
+				diagnostics.Warnings = append(diagnostics.Warnings, fmt.Sprintf("line %d: %s", lineNumber+1, warning))
+			}
+		}
+	}
+
+	if len(normalized.Groups) == 0 && len(normalized.Rules) == 0 {
+		return repository.NormalizedConfig{}, Diagnostics{}, fmt.Errorf("%w: no supported subconverter resources found", ErrInvalidImport)
+	}
+	return normalized, diagnostics, nil
+}
+
+func parseSubconverterProxyGroup(value string) (repository.NormalizedGroup, string, bool) {
+	parts := strings.Split(strings.TrimSpace(value), "`")
+	if len(parts) < 2 {
+		return repository.NormalizedGroup{}, "custom_proxy_group was skipped because it has no type", false
+	}
+	tag := strings.TrimSpace(parts[0])
+	groupType := normalizeSubconverterGroupType(parts[1])
+	if tag == "" {
+		return repository.NormalizedGroup{}, "custom_proxy_group was skipped because name is empty", false
+	}
+	outbounds := []string{}
+	for _, part := range parts[2:] {
+		part = strings.TrimSpace(part)
+		if !strings.HasPrefix(part, "[]") {
+			continue
+		}
+		outbound := strings.TrimSpace(strings.TrimPrefix(part, "[]"))
+		if outbound != "" {
+			outbounds = append(outbounds, normalizeClashRuleOutbound(outbound))
+		}
+	}
+	return repository.NormalizedGroup{
+		ID:        repository.NewID("group"),
+		Tag:       tag,
+		Type:      groupType,
+		Outbounds: appendUniqueStrings(nil, outbounds...),
+		Raw: map[string]any{
+			"name": tag,
+			"type": groupType,
+		},
+	}, "", true
+}
+
+func normalizeSubconverterGroupType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "url-test", "fallback", "load-balance", "select":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return "select"
+	}
+}
+
+func parseSubconverterRuleSet(value string, matcher singBoxBuiltInRuleSetMatcher, expander remoteRuleSetExpander) ([]repository.NormalizedRule, []string) {
+	outbound, source, ok := strings.Cut(strings.TrimSpace(value), ",")
+	if !ok {
+		return nil, []string{"ruleset was skipped because it has no source"}
+	}
+	outbound = normalizeClashRuleOutbound(outbound)
+	source = strings.TrimSpace(source)
+	if outbound == "" || source == "" {
+		return nil, []string{"ruleset was skipped because outbound or source is empty"}
+	}
+	if strings.HasPrefix(source, "[]") {
+		line, warning, ok := subconverterInlineRuleToClashRule(strings.TrimPrefix(source, "[]"), outbound)
+		if !ok {
+			return nil, []string{warning}
+		}
+		rules, warnings := normalizeClashRules([]string{line})
+		return rules, warnings
+	}
+	if ruleSetTag := subconverterSingBoxBuiltInRuleSetTag(source, matcher); ruleSetTag != "" {
+		return []repository.NormalizedRule{subconverterRemoteBuiltInRuleSetRule(source, outbound, ruleSetTag)}, nil
+	}
+	if expander != nil {
+		rules, warnings := expander(source, outbound)
+		if len(rules) > 0 {
+			warnings = append([]string{
+				fmt.Sprintf("remote ruleset %q has no built-in sing-box rule-set match and was expanded for sing-box", source),
+			}, warnings...)
+			return rules, warnings
+		}
+		if len(warnings) > 0 {
+			return []repository.NormalizedRule{subconverterRemoteUnsupportedSingBoxRule(source, outbound)}, append(warnings,
+				fmt.Sprintf("remote ruleset %q has no built-in sing-box rule-set match and expansion produced no rules; it was marked sing-box unsupported", source),
+			)
+		}
+	}
+	return []repository.NormalizedRule{subconverterRemoteUnsupportedSingBoxRule(source, outbound)}, []string{
+		fmt.Sprintf("remote ruleset %q has no built-in sing-box rule-set match and was marked sing-box unsupported", source),
+	}
+}
+
+func subconverterRemoteBuiltInRuleSetRule(source string, outbound string, ruleSetTag string) repository.NormalizedRule {
+	provider := subconverterMihomoRuleProvider(source)
+	return repository.NormalizedRule{
+		ID:                 repository.NewID("rule"),
+		Fields:             map[string]any{"rule_set": []string{ruleSetTag}},
+		Action:             "route",
+		Outbound:           outbound,
+		Raw:                []string{"RULE-SET," + provider.Provider + "," + outbound},
+		MihomoRuleProvider: &provider,
+	}
+}
+
+func subconverterRemoteUnsupportedSingBoxRule(source string, outbound string) repository.NormalizedRule {
+	provider := subconverterMihomoRuleProvider(source)
+	return repository.NormalizedRule{
+		ID:                 repository.NewID("rule"),
+		Action:             "route",
+		Outbound:           outbound,
+		Raw:                []string{"RULE-SET," + provider.Provider + "," + outbound},
+		MihomoRuleProvider: &provider,
+		UnsupportedCores:   []repository.Core{repository.CoreSingBox},
+		UnsupportedReason:  "未匹配到内置 sing-box 规则集",
+	}
+}
+
+func subconverterSingBoxBuiltInRuleSetTag(source string, matcher singBoxBuiltInRuleSetMatcher) string {
+	if matcher == nil {
+		return ""
+	}
+	name := subconverterRuleSourceBaseName(source)
+	if name == "" {
+		return ""
+	}
+	for _, candidate := range singBoxGeositeNameCandidates(name) {
+		if tag := matcher(candidate); tag != "" {
+			return tag
+		}
+	}
+	return ""
+}
+
+func singBoxGeositeNameCandidates(name string) []string {
+	return appendUniqueStrings(nil,
+		strings.ToLower(strings.TrimSpace(name)),
+		normalizeRuleSetAliasKey(splitTrailingAcronymRuleSetName(name)),
+		normalizeRuleSetAliasKey(name),
+		normalizeRuleSetAliasKey(splitCamelRuleSetName(name)),
+	)
+}
+
+func splitTrailingAcronymRuleSetName(name string) string {
+	runes := []rune(strings.TrimSpace(name))
+	if len(runes) == 0 {
+		return ""
+	}
+	start := len(runes)
+	for start > 0 && isASCIIUpper(runes[start-1]) {
+		start--
+	}
+	if start == 0 || start == len(runes) || len(runes)-start < 2 || !isASCIILower(runes[start-1]) {
+		return string(runes)
+	}
+	return string(runes[:start]) + "-" + string(runes[start:])
+}
+
+func splitCamelRuleSetName(name string) string {
+	runes := []rune(strings.TrimSpace(name))
+	if len(runes) == 0 {
+		return ""
+	}
+	var builder strings.Builder
+	for index, char := range runes {
+		if index > 0 && isASCIIUpper(char) && (isASCIILower(runes[index-1]) || nextRuneIsLower(runes, index)) {
+			builder.WriteRune('-')
+		}
+		builder.WriteRune(char)
+	}
+	return builder.String()
+}
+
+func nextRuneIsLower(runes []rune, index int) bool {
+	return index+1 < len(runes) && isASCIILower(runes[index+1])
+}
+
+func isASCIIUpper(char rune) bool {
+	return char >= 'A' && char <= 'Z'
+}
+
+func isASCIILower(char rune) bool {
+	return char >= 'a' && char <= 'z'
+}
+
+func normalizeRuleSetAliasKey(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	builder := strings.Builder{}
+	lastDash := false
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') {
+			builder.WriteRune(char)
+			lastDash = false
+			continue
+		}
+		if char == '!' {
+			builder.WriteRune(char)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			builder.WriteRune('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(builder.String(), "-")
+}
+
+func subconverterMihomoRuleProvider(source string) repository.MihomoRuleProviderResource {
+	return repository.MihomoRuleProviderResource{
+		Metadata: repository.Metadata{
+			ID:         subconverterRuleProviderName(source),
+			Name:       subconverterRuleProviderName(source),
+			OriginType: repository.OriginClashSubscription,
+		},
+		Provider:   subconverterRuleProviderName(source),
+		SourceMode: repository.RuleAssetSourceModeRemote,
+		URL:        source,
+		Behavior:   "classical",
+		Format:     "text",
+		Interval:   "86400",
+	}
+}
+
+func subconverterRuleProviderName(source string) string {
+	name := subconverterRuleSourceBaseName(source)
+	name = sanitizeRuleProviderName(name)
+	if name == "" {
+		name = "ruleset"
+	}
+	sum := sha1.Sum([]byte(source))
+	return "subconverter-" + name + "-" + hex.EncodeToString(sum[:])[:8]
+}
+
+func subconverterRuleSourceBaseName(source string) string {
+	if parsed, err := url.Parse(source); err == nil {
+		parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+		if len(parts) > 0 {
+			return trimRuleSourceSuffix(parts[len(parts)-1])
+		}
+	}
+	return ""
+}
+
+func trimRuleSourceSuffix(name string) string {
+	name = strings.TrimSpace(name)
+	if dot := strings.LastIndex(name, "."); dot > 0 {
+		return name[:dot]
+	}
+	return name
+}
+
+func sanitizeRuleProviderName(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	builder := strings.Builder{}
+	lastDash := false
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') {
+			builder.WriteRune(char)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			builder.WriteRune('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(builder.String(), "-")
+}
+
+func subconverterInlineRuleToClashRule(value string, outbound string) (string, string, bool) {
+	parts := trimStrings(splitTopLevel(value, ','))
+	if len(parts) == 0 {
+		return "", "inline ruleset was skipped because it is empty", false
+	}
+	ruleType := strings.ToUpper(parts[0])
+	switch ruleType {
+	case "FINAL", "MATCH":
+		return "MATCH," + outbound, "", true
+	default:
+		if len(parts) < 2 {
+			return "", fmt.Sprintf("inline ruleset %q was skipped because it has no payload", value), false
+		}
+		return strings.Join(append([]string{ruleType, parts[1], outbound}, parts[2:]...), ","), "", true
+	}
 }
 
 func mergeContiguousAtomicRules(left repository.NormalizedRule, right repository.NormalizedRule) (repository.NormalizedRule, bool) {
@@ -904,6 +1408,20 @@ func trimStrings(values []string) []string {
 		if trimmed := strings.TrimSpace(value); trimmed != "" {
 			result = append(result, trimmed)
 		}
+	}
+	return result
+}
+
+func appendUniqueStrings(base []string, values ...string) []string {
+	seen := map[string]bool{}
+	result := make([]string, 0, len(base)+len(values))
+	for _, value := range append(append([]string(nil), base...), values...) {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
 	}
 	return result
 }

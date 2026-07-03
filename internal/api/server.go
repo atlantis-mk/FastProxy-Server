@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -71,6 +74,13 @@ type githubTokenSetting struct {
 	Source     string `json:"source,omitempty"`
 }
 
+type runtimeResourceItem struct {
+	Name      string    `json:"name"`
+	Path      string    `json:"path"`
+	Size      int64     `json:"size"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
 func ListenAndServe(ctx context.Context, addr string, handler http.Handler) error {
 	server := &http.Server{
 		Addr:              addr,
@@ -110,6 +120,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/runtime/restart", s.handleRuntimeRestart)
 	s.mux.HandleFunc("POST /api/runtime/compile-and-start", s.handleRuntimeRestartAndApply)
 	s.mux.HandleFunc("POST /api/runtime/restart-and-apply", s.handleRuntimeRestartAndApply)
+	s.mux.HandleFunc("GET /api/runtime/resources", s.handleListRuntimeResources)
+	s.mux.HandleFunc("POST /api/runtime/resources/upload", s.handleUploadRuntimeResource)
 	s.mux.HandleFunc("/api/runtime/controller/", s.handleRuntimeControllerProxy)
 	s.mux.HandleFunc("/api/runtime/controller", s.handleRuntimeControllerProxy)
 	s.mux.HandleFunc("GET /api/profiles", s.handleListProfiles)
@@ -140,6 +152,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /api/repository/routing-rule-sets/{id}", s.handleUpdateRoutingRuleSet)
 	s.mux.HandleFunc("DELETE /api/repository/routing-rule-sets/{id}", s.handleDeleteRoutingRuleSet)
 	s.mux.HandleFunc("GET /api/repository/rule-source-repositories", s.handleListRuleSourceRepositories)
+	s.mux.HandleFunc("GET /api/repository/rule-source-repositories/page", s.handleQueryRuleSourceRepositories)
 	s.mux.HandleFunc("POST /api/repository/rule-source-repositories", s.handleCreateRuleSourceRepository)
 	s.mux.HandleFunc("GET /api/repository/rule-source-repositories/{id}", s.handleGetRuleSourceRepository)
 	s.mux.HandleFunc("PUT /api/repository/rule-source-repositories/{id}", s.handleUpdateRuleSourceRepository)
@@ -150,11 +163,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/repository/rule-source-repositories/{id}/index/refresh", s.handleRefreshRuleSourceRepositoryIndex)
 	s.mux.HandleFunc("POST /api/repository/rule-source-repositories/{id}/selectable-files/refresh", s.handleRefreshRuleSourceSelectableFiles)
 	s.mux.HandleFunc("GET /api/repository/sing-box-rule-sets", s.handleListSingBoxRuleSets)
+	s.mux.HandleFunc("GET /api/repository/sing-box-rule-sets/page", s.handleQuerySingBoxRuleSets)
 	s.mux.HandleFunc("POST /api/repository/sing-box-rule-sets", s.handleCreateSingBoxRuleSet)
 	s.mux.HandleFunc("GET /api/repository/sing-box-rule-sets/{id}", s.handleGetSingBoxRuleSet)
 	s.mux.HandleFunc("PUT /api/repository/sing-box-rule-sets/{id}", s.handleUpdateSingBoxRuleSet)
 	s.mux.HandleFunc("DELETE /api/repository/sing-box-rule-sets/{id}", s.handleDeleteSingBoxRuleSet)
 	s.mux.HandleFunc("GET /api/repository/mihomo-rule-providers", s.handleListMihomoRuleProviders)
+	s.mux.HandleFunc("GET /api/repository/mihomo-rule-providers/page", s.handleQueryMihomoRuleProviders)
 	s.mux.HandleFunc("POST /api/repository/mihomo-rule-providers", s.handleCreateMihomoRuleProvider)
 	s.mux.HandleFunc("GET /api/repository/mihomo-rule-providers/{id}", s.handleGetMihomoRuleProvider)
 	s.mux.HandleFunc("PUT /api/repository/mihomo-rule-providers/{id}", s.handleUpdateMihomoRuleProvider)
@@ -172,6 +187,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/repository/imports/plain-nodes", s.handleImportPlainNodes)
 	s.mux.HandleFunc("POST /api/repository/imports/manual-node", s.handleImportManualNode)
 	s.mux.HandleFunc("DELETE /api/repository/imports/manual-node", s.handleDeleteManualNode)
+	s.mux.HandleFunc("POST /api/repository/remote-text/fetch", s.handleFetchRemoteText)
+	s.mux.HandleFunc("POST /api/repository/remote-rule-set/expand", s.handleExpandRemoteRuleSet)
 	s.mux.Handle("/", newWebAppHandler(webui.EmbeddedDist()))
 }
 
@@ -283,12 +300,108 @@ func (s *Server) handleCoreUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	cache, err := core.InstallLocal(s.cfg.DataDir, coreName, header.Filename, file)
+	cache, err := core.InstallLocalVersion(s.cfg.DataDir, coreName, header.Filename, r.FormValue("version"), file)
 	if err != nil {
 		httpjson.WriteError(w, http.StatusBadRequest, "core_upload_failed", err.Error())
 		return
 	}
 	httpjson.Write(w, http.StatusOK, cache)
+}
+
+func (s *Server) handleListRuntimeResources(w http.ResponseWriter, r *http.Request) {
+	dir := filepath.Join(s.cfg.DataDir, "runtime")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			httpjson.Write(w, http.StatusOK, map[string]any{"resources": []runtimeResourceItem{}})
+			return
+		}
+		httpjson.WriteError(w, http.StatusInternalServerError, "runtime_resources_read_failed", err.Error())
+		return
+	}
+
+	resources := []runtimeResourceItem{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		name := entry.Name()
+		resources = append(resources, runtimeResourceItem{
+			Name:      name,
+			Path:      filepath.Join(dir, name),
+			Size:      info.Size(),
+			UpdatedAt: info.ModTime().UTC(),
+		})
+	}
+	httpjson.Write(w, http.StatusOK, map[string]any{"resources": resources})
+}
+
+func (s *Server) handleUploadRuntimeResource(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(256 << 20); err != nil {
+		httpjson.WriteError(w, http.StatusBadRequest, "invalid_runtime_resource_upload", err.Error())
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		httpjson.WriteError(w, http.StatusBadRequest, "runtime_resource_file_missing", err.Error())
+		return
+	}
+	defer file.Close()
+
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" {
+		name = header.Filename
+	}
+	if name == "." || name == ".." || filepath.Base(name) != name || strings.ContainsAny(name, `/\`) {
+		httpjson.WriteError(w, http.StatusBadRequest, "invalid_runtime_resource_name", "resource name must be a file name")
+		return
+	}
+
+	dir := filepath.Join(s.cfg.DataDir, "runtime")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		httpjson.WriteError(w, http.StatusInternalServerError, "runtime_resource_dir_create_failed", err.Error())
+		return
+	}
+	path := filepath.Join(dir, name)
+	tmp := path + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		httpjson.WriteError(w, http.StatusInternalServerError, "runtime_resource_create_failed", err.Error())
+		return
+	}
+	_, copyErr := io.Copy(out, file)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmp)
+		httpjson.WriteError(w, http.StatusInternalServerError, "runtime_resource_write_failed", copyErr.Error())
+		return
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		httpjson.WriteError(w, http.StatusInternalServerError, "runtime_resource_write_failed", closeErr.Error())
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		httpjson.WriteError(w, http.StatusInternalServerError, "runtime_resource_install_failed", err.Error())
+		return
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		httpjson.WriteError(w, http.StatusInternalServerError, "runtime_resource_stat_failed", err.Error())
+		return
+	}
+	httpjson.Write(w, http.StatusOK, runtimeResourceItem{
+		Name:      name,
+		Path:      path,
+		Size:      info.Size(),
+		UpdatedAt: info.ModTime().UTC(),
+	})
 }
 
 func (s *Server) coreInventoryFor(coreName repository.Core, configuredPath string) coreInventoryItem {
@@ -853,6 +966,20 @@ func (s *Server) handleListRuleSourceRepositories(w http.ResponseWriter, r *http
 	httpjson.Write(w, http.StatusOK, items)
 }
 
+func (s *Server) handleQueryRuleSourceRepositories(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	page, err := s.store.QueryRuleSourceRepositories(
+		parseOptionalPositiveInt(query.Get("offset"), 0),
+		parseOptionalPositiveInt(query.Get("limit"), 20),
+		query.Get("q"),
+	)
+	if err != nil {
+		httpjson.WriteError(w, http.StatusInternalServerError, "rule_source_repositories_read_failed", err.Error())
+		return
+	}
+	httpjson.Write(w, http.StatusOK, page)
+}
+
 func (s *Server) handleGetRuleSourceRepository(w http.ResponseWriter, r *http.Request) {
 	item, err := s.store.GetRuleSourceRepository(r.PathValue("id"))
 	s.writeRepositoryResponse(w, item, err, "rule_source_repository")
@@ -916,7 +1043,17 @@ func (s *Server) handleBrowseRuleSourceRepositoryTree(w http.ResponseWriter, r *
 func (s *Server) handleGetRuleSourceRepositoryIndex(w http.ResponseWriter, r *http.Request) {
 	offset := parseOptionalPositiveInt(r.URL.Query().Get("offset"), 0)
 	limit := parseOptionalPositiveInt(r.URL.Query().Get("limit"), 500)
-	index, err := s.store.GetRuleSourceIndexPage(r.PathValue("id"), r.URL.Query().Get("path"), offset, limit)
+	flat := strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("flat")), "true") ||
+		strings.TrimSpace(r.URL.Query().Get("flat")) == "1"
+	var (
+		index repository.RuleSourceIndex
+		err   error
+	)
+	if flat {
+		index, err = s.store.GetRuleSourceIndexFlatPage(r.PathValue("id"), offset, limit)
+	} else {
+		index, err = s.store.GetRuleSourceIndexPage(r.PathValue("id"), r.URL.Query().Get("path"), offset, limit)
+	}
 	if err != nil {
 		s.writeRuleRepositoryError(w, err, "rule_source_repository_index_failed", "rule_source_repository")
 		return
@@ -1070,6 +1207,20 @@ func (s *Server) handleListSingBoxRuleSets(w http.ResponseWriter, r *http.Reques
 	httpjson.Write(w, http.StatusOK, items)
 }
 
+func (s *Server) handleQuerySingBoxRuleSets(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	page, err := s.store.QuerySingBoxRuleSets(
+		parseOptionalPositiveInt(query.Get("offset"), 0),
+		parseOptionalPositiveInt(query.Get("limit"), 20),
+		query.Get("q"),
+	)
+	if err != nil {
+		httpjson.WriteError(w, http.StatusInternalServerError, "sing_box_rule_sets_read_failed", err.Error())
+		return
+	}
+	httpjson.Write(w, http.StatusOK, page)
+}
+
 func (s *Server) handleGetSingBoxRuleSet(w http.ResponseWriter, r *http.Request) {
 	item, err := s.store.GetSingBoxRuleSet(r.PathValue("id"))
 	s.writeRepositoryResponse(w, item, err, "sing_box_rule_set")
@@ -1118,6 +1269,20 @@ func (s *Server) handleListMihomoRuleProviders(w http.ResponseWriter, r *http.Re
 		return
 	}
 	httpjson.Write(w, http.StatusOK, items)
+}
+
+func (s *Server) handleQueryMihomoRuleProviders(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	page, err := s.store.QueryMihomoRuleProviders(
+		parseOptionalPositiveInt(query.Get("offset"), 0),
+		parseOptionalPositiveInt(query.Get("limit"), 20),
+		query.Get("q"),
+	)
+	if err != nil {
+		httpjson.WriteError(w, http.StatusInternalServerError, "mihomo_rule_providers_read_failed", err.Error())
+		return
+	}
+	httpjson.Write(w, http.StatusOK, page)
 }
 
 func (s *Server) handleGetMihomoRuleProvider(w http.ResponseWriter, r *http.Request) {
@@ -1231,6 +1396,64 @@ func (s *Server) handleImportManualNode(w http.ResponseWriter, r *http.Request) 
 	}
 	result, err := s.imports.CreateManualNode(input)
 	s.writeImportResponse(w, result, err, "manual_node_import_failed")
+}
+
+func (s *Server) handleFetchRemoteText(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		httpjson.WriteError(w, http.StatusBadRequest, "invalid_remote_text_fetch", "request body must be valid JSON")
+		return
+	}
+	target := strings.TrimSpace(input.URL)
+	parsed, err := url.Parse(target)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		httpjson.WriteError(w, http.StatusBadRequest, "invalid_remote_text_url", "url must be an absolute http or https URL")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		httpjson.WriteError(w, http.StatusBadRequest, "invalid_remote_text_url", err.Error())
+		return
+	}
+	req.Header.Set("User-Agent", "FastProxy")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		httpjson.WriteError(w, http.StatusBadGateway, "remote_text_fetch_failed", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		httpjson.WriteError(w, http.StatusBadGateway, "remote_text_fetch_failed", "remote returned "+resp.Status)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		httpjson.WriteError(w, http.StatusBadGateway, "remote_text_fetch_failed", err.Error())
+		return
+	}
+	httpjson.Write(w, http.StatusOK, map[string]any{"content": string(body)})
+}
+
+func (s *Server) handleExpandRemoteRuleSet(w http.ResponseWriter, r *http.Request) {
+	var input importer.RemoteRuleSetExpandInput
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		httpjson.WriteError(w, http.StatusBadRequest, "invalid_remote_rule_set_expand", "request body must be valid JSON")
+		return
+	}
+	result, err := s.imports.ExpandRemoteRuleSet(input)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, importer.ErrInvalidImport) {
+			status = http.StatusBadRequest
+		}
+		httpjson.WriteError(w, status, "remote_rule_set_expand_failed", err.Error())
+		return
+	}
+	httpjson.Write(w, http.StatusOK, result)
 }
 
 func (s *Server) handleDeleteManualNode(w http.ResponseWriter, r *http.Request) {

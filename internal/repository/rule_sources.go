@@ -341,31 +341,60 @@ func (b *RuleSourceRepositoryBrowser) RefreshSelectableFiles(repo RuleSourceRepo
 }
 
 func (b *RuleSourceRepositoryBrowser) RefreshIndex(repo RuleSourceRepository) (RuleSourceIndex, error) {
-	entriesByLogicalPath := map[string]RuleSourceIndexEntry{}
-	refs := map[Core]string{}
+	return b.refreshIndex(repo, true)
+}
+
+func (b *RuleSourceRepositoryBrowser) RefreshRemoteIndex(repo RuleSourceRepository) (RuleSourceIndex, error) {
+	return b.refreshIndex(repo, false)
+}
+
+func (b *RuleSourceRepositoryBrowser) refreshIndex(repo RuleSourceRepository, allowSnapshotFallback bool) (RuleSourceIndex, error) {
+	pathsByCore := map[Core][]string{}
 	for _, mapping := range repo.CoreMappings {
 		switch repo.Provider {
 		case RuleSourceRepositoryProviderGitHub:
 			files, err := b.refreshGitHubIndexFiles(repo, mapping)
 			if err != nil {
+				if allowSnapshotFallback {
+					if snapshot, ok := builtInRuleSourceIndexSnapshot(repo.ID); ok {
+						return snapshot, nil
+					}
+				}
 				return RuleSourceIndex{}, err
 			}
-			refs[mapping.Core] = mapping.Ref
 			for _, file := range files {
-				entry := entriesByLogicalPath[file.LogicalPath]
-				if entry.Files == nil {
-					entry.Files = map[Core]RuleSourceIndexFile{}
-				}
-				entry.LogicalPath = file.LogicalPath
-				entry.Name = file.Name
-				entry.Files[file.Core] = file
-				entriesByLogicalPath[file.LogicalPath] = entry
+				pathsByCore[mapping.Core] = append(pathsByCore[mapping.Core], file.Path)
 			}
 		default:
 			return RuleSourceIndex{}, fmt.Errorf("%w: unsupported provider %q", ErrRuleSourceTreeLookup, repo.Provider)
 		}
 	}
+	return BuildRuleSourceIndexFromFiles(repo, pathsByCore), nil
+}
 
+func BuildRuleSourceIndexFromFiles(repo RuleSourceRepository, pathsByCore map[Core][]string) RuleSourceIndex {
+	entriesByLogicalPath := map[string]RuleSourceIndexEntry{}
+	refs := map[Core]string{}
+	for _, mapping := range repo.CoreMappings {
+		refs[mapping.Core] = mapping.Ref
+		for _, filePath := range pathsByCore[mapping.Core] {
+			if ruleSourceIndexPathIgnored(filePath) {
+				continue
+			}
+			file, ok := inferIndexFile(repo, mapping.Core, filePath)
+			if !ok {
+				continue
+			}
+			entry := entriesByLogicalPath[file.LogicalPath]
+			if entry.Files == nil {
+				entry.Files = map[Core]RuleSourceIndexFile{}
+			}
+			entry.LogicalPath = file.LogicalPath
+			entry.Name = file.Name
+			entry.Files[file.Core] = file
+			entriesByLogicalPath[file.LogicalPath] = entry
+		}
+	}
 	entries := make([]RuleSourceIndexEntry, 0, len(entriesByLogicalPath))
 	for _, entry := range entriesByLogicalPath {
 		entries = append(entries, entry)
@@ -381,7 +410,11 @@ func (b *RuleSourceRepositoryBrowser) RefreshIndex(repo RuleSourceRepository) (R
 		Refs:         refs,
 		RefreshedAt:  time.Now().UTC(),
 		Entries:      entries,
-	}, nil
+	}
+}
+
+func ruleSourceIndexPathIgnored(filePath string) bool {
+	return strings.HasPrefix(normalizeRepositoryRootPath(filePath), "asn/")
 }
 
 func (b *RuleSourceRepositoryBrowser) browseGitHub(repo RuleSourceRepository, mapping RuleSourceCoreMapping, requestedPath string) (RuleSourceTree, error) {

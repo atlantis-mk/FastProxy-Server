@@ -49,6 +49,104 @@ func TestStoreInitializesNodeCacheSchema(t *testing.T) {
 	}
 }
 
+func TestRuleSetSupportedCoresDerivedFromRuleCompatibility(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+
+	mixed, err := store.CreateRuleSet(RuleSetResource{
+		Metadata:       Metadata{Name: "Mixed"},
+		SupportedCores: []Core{CoreMihomo},
+		Rules: []NormalizedRule{
+			{
+				ID:               "unsupported",
+				Raw:              []string{"RULE-SET,NoMatch,Proxy"},
+				Outbound:         "Proxy",
+				UnsupportedCores: []Core{CoreSingBox},
+			},
+			{
+				ID:       "youtube",
+				Fields:   map[string]any{"rule_set": []string{"geosite-youtube"}},
+				Outbound: "Proxy",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateRuleSet(mixed) error = %v", err)
+	}
+	if fmt.Sprint(mixed.SupportedCores) != "[mihomo sing-box]" {
+		t.Fatalf("mixed.SupportedCores = %#v, want mihomo and sing-box", mixed.SupportedCores)
+	}
+
+	mihomoOnly, err := store.CreateRuleSet(RuleSetResource{
+		Metadata: Metadata{Name: "Mihomo Only"},
+		Rules: []NormalizedRule{
+			{
+				ID:               "unsupported",
+				Raw:              []string{"RULE-SET,NoMatch,Proxy"},
+				Outbound:         "Proxy",
+				UnsupportedCores: []Core{CoreSingBox},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateRuleSet(mihomoOnly) error = %v", err)
+	}
+	if fmt.Sprint(mihomoOnly.SupportedCores) != "[mihomo]" {
+		t.Fatalf("mihomoOnly.SupportedCores = %#v, want mihomo only", mihomoOnly.SupportedCores)
+	}
+}
+
+func TestRuleSetPreservesRuleCardLeafSourceRule(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+
+	created, err := store.CreateRuleSet(RuleSetResource{
+		Metadata: Metadata{Name: "Remote INI"},
+		RuleCards: []RoutingRuleCardUI{{
+			Enabled: true,
+			ID:      "card-youtube",
+			Name:    "Proxy",
+			Rules: []RoutingRuleLeafUI{{
+				Condition: "RULE-SET",
+				ID:        "rule-youtube",
+				Target:    "Proxy",
+				Value:     "YouTube",
+				SourceRule: &NormalizedRule{
+					ID:       "rule-youtube",
+					Fields:   map[string]any{"rule_set": []string{"geo/geosite/youtube"}},
+					Raw:      []string{"RULE-SET,YouTube,Proxy"},
+					Outbound: "Proxy",
+				},
+			}},
+		}},
+		Rules: []NormalizedRule{{
+			ID:       "rule-youtube",
+			Fields:   map[string]any{"rule_set": []string{"geo/geosite/youtube"}},
+			Raw:      []string{"RULE-SET,YouTube,Proxy"},
+			Outbound: "Proxy",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CreateRuleSet() error = %v", err)
+	}
+
+	read, err := store.GetRuleSet(created.ID)
+	if err != nil {
+		t.Fatalf("GetRuleSet() error = %v", err)
+	}
+	sourceRule := read.RuleCards[0].Rules[0].SourceRule
+	if sourceRule == nil {
+		t.Fatalf("SourceRule was not preserved: %#v", read.RuleCards[0].Rules[0])
+	}
+	if fmt.Sprint(sourceRule.Fields["rule_set"]) != "[geo/geosite/youtube]" {
+		t.Fatalf("source rule_set = %#v, want geo/geosite/youtube", sourceRule.Fields["rule_set"])
+	}
+}
+
 func TestGlobalConfigInitializesAndPersistsDefaultDNS(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
@@ -96,14 +194,14 @@ func TestGlobalConfigInitializesAndPersistsDefaultDNS(t *testing.T) {
 		t.Fatalf("Inbounds[4] = %#v, want default tproxy inbound", config.Inbounds[4])
 	}
 	tun := config.Inbounds[5].Tun
-	if config.Inbounds[5].Kind != "tun" || tun.InterfaceName != "utun" || tun.Stack != "system" {
+	if config.Inbounds[5].Kind != "tun" || tun.InterfaceName != "utun101" || tun.Stack != "system" {
 		t.Fatalf("Inbounds[5] = %#v, want default tun inbound", config.Inbounds[5])
 	}
 	if len(tun.Address) != 1 || tun.Address[0] != "172.19.0.1/30" {
 		t.Fatalf("tun.Address = %#v, want default interface address", tun.Address)
 	}
-	if tun.AutoRoute || tun.AutoDetectInterface || tun.AutoRedirect || tun.StrictRoute {
-		t.Fatalf("tun = %#v, want route flags disabled", tun)
+	if !tun.AutoRoute || !tun.AutoDetectInterface || !tun.AutoRedirect || tun.StrictRoute {
+		t.Fatalf("tun = %#v, want route flags enabled except strict route", tun)
 	}
 	if len(tun.DNSHijack) != 1 || tun.DNSHijack[0] != "any:53" {
 		t.Fatalf("tun.DNSHijack = %#v, want DNS hijack target", tun.DNSHijack)
@@ -118,13 +216,13 @@ func TestGlobalConfigInitializesAndPersistsDefaultDNS(t *testing.T) {
 	if len(config.DNSServers) != 9 {
 		t.Fatalf("len(DNSServers) = %d, want default and proxy nameserver defaults", len(config.DNSServers))
 	}
-	if config.DNSServers[0].Role != "default" || config.DNSServers[0].Address != "119.29.29.29" {
+	if config.DNSServers[0].Role != "default" || config.DNSServers[0].Address != "223.5.5.5" {
 		t.Fatalf("DNSServers[0] = %#v, want first default nameserver", config.DNSServers[0])
 	}
 	if config.DNSServers[2].Protocol != "tls" || config.DNSServers[2].Port != "853" {
 		t.Fatalf("DNSServers[2] = %#v, want parsed TLS nameserver", config.DNSServers[2])
 	}
-	if config.DNSServers[6].Role != "proxy" || config.DNSServers[6].Protocol != "https" || config.DNSServers[6].Address != "1.1.1.1" || config.DNSServers[6].Path != "/dns-query" {
+	if config.DNSServers[6].Role != "proxy" || config.DNSServers[6].Protocol != "https" || config.DNSServers[6].Address != "8.8.8.8" || config.DNSServers[6].Path != "/dns-query" {
 		t.Fatalf("DNSServers[6] = %#v, want proxy DoH nameserver defaults", config.DNSServers[6])
 	}
 
@@ -247,7 +345,7 @@ func TestGlobalConfigMigratesLegacyProxyDNSDefaults(t *testing.T) {
 	if len(config.DNSServers) != 9 {
 		t.Fatalf("len(DNSServers) = %d, want migrated default DNS servers", len(config.DNSServers))
 	}
-	if config.DNSServers[6].Role != "proxy" || config.DNSServers[6].Protocol != "https" || config.DNSServers[6].Address != "1.1.1.1" {
+	if config.DNSServers[6].Role != "proxy" || config.DNSServers[6].Protocol != "https" || config.DNSServers[6].Address != "8.8.8.8" {
 		t.Fatalf("DNSServers[6] = %#v, want migrated proxy DoH server", config.DNSServers[6])
 	}
 
@@ -255,7 +353,7 @@ func TestGlobalConfigMigratesLegacyProxyDNSDefaults(t *testing.T) {
 	if err := store.readRepositoryResource(configResourceKind, globalConfigResourceID, &persisted); err != nil {
 		t.Fatalf("read persisted global config error = %v", err)
 	}
-	if len(persisted.DNSServers) != 9 || persisted.DNSServers[6].Address != "1.1.1.1" {
+	if len(persisted.DNSServers) != 9 || persisted.DNSServers[6].Address != "8.8.8.8" {
 		t.Fatalf("persisted DNSServers = %#v, want migrated proxy DNS persisted", persisted.DNSServers)
 	}
 }

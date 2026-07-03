@@ -47,10 +47,10 @@ func (Mihomo) RuntimeBaseURL(runtime RuntimeConfig) string {
 	return (&url.URL{Scheme: "http", Host: runtime.ExternalController}).String()
 }
 func (Mihomo) StartCommand(binaryPath string, configPath string) []string {
-	return []string{binaryPath, "-f", configPath}
+	return []string{binaryPath, "-d", filepath.Dir(configPath), "-f", configPath}
 }
 func (Mihomo) Validate(ctx context.Context, binaryPath string, configPath string) error {
-	return runValidation(ctx, binaryPath, []string{"-t", "-f", configPath})
+	return runValidation(ctx, binaryPath, []string{"-d", filepath.Dir(configPath), "-t", "-f", configPath}, configPath)
 }
 func (m Mihomo) HealthCheck(ctx context.Context, runtime RuntimeConfig) error {
 	return httpHealth(ctx, m.RuntimeBaseURL(runtime)+"/version", runtime.Secret)
@@ -69,7 +69,7 @@ func (SingBox) StartCommand(binaryPath string, configPath string) []string {
 	return []string{binaryPath, "run", "-c", configPath}
 }
 func (SingBox) Validate(ctx context.Context, binaryPath string, configPath string) error {
-	return runValidation(ctx, binaryPath, []string{"check", "-c", configPath})
+	return runValidation(ctx, binaryPath, []string{"check", "-c", configPath}, configPath)
 }
 func (s SingBox) HealthCheck(ctx context.Context, runtime RuntimeConfig) error {
 	return httpHealth(ctx, s.RuntimeBaseURL(runtime)+"/version", runtime.Secret)

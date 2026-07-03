@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -9,6 +11,35 @@ import (
 
 	"github.com/atlantis-mk/FastProxy-Server/internal/repository"
 )
+
+func TestEnsureEmbeddedMihomoGeoResourcesExtractsMissingFiles(t *testing.T) {
+	runtimeDir := t.TempDir()
+	existing := filepath.Join(runtimeDir, "geoip.dat")
+	if err := os.WriteFile(existing, []byte("custom"), 0o644); err != nil {
+		t.Fatalf("WriteFile(existing) error = %v", err)
+	}
+
+	if err := ensureEmbeddedMihomoGeoResources(runtimeDir); err != nil {
+		t.Fatalf("ensureEmbeddedMihomoGeoResources() error = %v", err)
+	}
+
+	for _, name := range []string{"geoip.dat", "geosite.dat", "country.mmdb", "GeoLite2-ASN.mmdb"} {
+		info, err := os.Stat(filepath.Join(runtimeDir, name))
+		if err != nil {
+			t.Fatalf("Stat(%s) error = %v", name, err)
+		}
+		if info.Size() == 0 {
+			t.Fatalf("%s should not be empty", name)
+		}
+	}
+	data, err := os.ReadFile(existing)
+	if err != nil {
+		t.Fatalf("ReadFile(existing) error = %v", err)
+	}
+	if string(data) != "custom" {
+		t.Fatalf("existing geoip.dat was overwritten")
+	}
+}
 
 func TestCompileRuntimeUsesAllNodeAndGroupSets(t *testing.T) {
 	store, err := repository.NewStore(t.TempDir())
@@ -194,6 +225,96 @@ func TestCompileRuntimeIncludesManualNodesReferencedBySelectedGroups(t *testing.
 	}
 }
 
+func TestCompileRuntimeDropsStaleOutboundReferencesAfterSubscriptionRename(t *testing.T) {
+	store, err := repository.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	ruleSet, err := store.CreateRuleSet(repository.RuleSetResource{
+		Metadata: repository.Metadata{Name: "Daily"},
+		Rules: []repository.NormalizedRule{
+			{
+				Fields:   map[string]any{"domain": []string{"old.example.com"}},
+				Raw:      []string{"DOMAIN,old.example.com,Old Node"},
+				Outbound: "Old Node",
+			},
+			{
+				Fields:   map[string]any{"domain_suffix": []string{"kept.example.com"}},
+				Raw:      []string{"DOMAIN-SUFFIX,kept.example.com,Proxy"},
+				Outbound: "Proxy",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateRuleSet() error = %v", err)
+	}
+	if _, err := store.CreateNodeSet(repository.NodeSetResource{
+		Metadata: repository.Metadata{Name: "Daily"},
+		Nodes: []repository.NormalizedNode{
+			{Tag: "New Node", Type: "http", Server: "new.example", ServerPort: 8080},
+		},
+	}); err != nil {
+		t.Fatalf("CreateNodeSet() error = %v", err)
+	}
+	if _, err := store.CreateGroupSet(repository.GroupSetResource{
+		Metadata: repository.Metadata{Name: "Daily"},
+		Groups: []repository.NormalizedGroup{
+			{Tag: "Proxy", Type: "select", Outbounds: []string{"Old Node"}},
+		},
+	}); err != nil {
+		t.Fatalf("CreateGroupSet() error = %v", err)
+	}
+
+	for _, core := range []repository.Core{repository.CoreMihomo, repository.CoreSingBox} {
+		t.Run(string(core), func(t *testing.T) {
+			compiled, err := (&Server{store: store}).compileRuntime(context.Background(), runtimeSelection{
+				SelectedCore: core,
+				RuleSetIDs:   []string{ruleSet.ID},
+			}, "")
+			if err != nil {
+				t.Fatalf("compileRuntime() error = %v", err)
+			}
+			output := string(compiled.Data)
+			if strings.Contains(output, "Old Node") {
+				t.Fatalf("compiled runtime kept stale outbound:\n%s", output)
+			}
+			if !strings.Contains(output, "Proxy") {
+				t.Fatalf("compiled runtime dropped available group target:\n%s", output)
+			}
+			if !strings.Contains(output, "DIRECT") {
+				t.Fatalf("compiled runtime did not fallback stale group to DIRECT:\n%s", output)
+			}
+		})
+	}
+}
+
+func TestMihomoRuntimeConfigFiltersStaleGroupOutbound(t *testing.T) {
+	runtimeConfig := mihomoRuntimeConfig(
+		repository.GlobalConfig{},
+		[]repository.NormalizedNode{
+			{Tag: "BUD优选-new", Type: "http", Server: "new.example", ServerPort: 8080},
+		},
+		[]repository.NormalizedGroup{
+			{Tag: "BUD", Type: "select", Outbounds: []string{"BUD优选37"}},
+		},
+		nil,
+		nil,
+		nil,
+		"0.0.0.0:9090",
+	)
+	data, err := marshalMihomoRuntimeConfig(runtimeConfig)
+	if err != nil {
+		t.Fatalf("marshalMihomoRuntimeConfig() error = %v", err)
+	}
+	output := string(data)
+	if strings.Contains(output, "BUD优选37") {
+		t.Fatalf("mihomo runtime kept stale group outbound:\n%s", output)
+	}
+	if !strings.Contains(output, "    - DIRECT") {
+		t.Fatalf("mihomo runtime did not fallback stale group to DIRECT:\n%s", output)
+	}
+}
+
 func TestMihomoRuntimeConfigMatchesStandardDefaultShape(t *testing.T) {
 	store, err := repository.NewStore(t.TempDir())
 	if err != nil {
@@ -294,12 +415,77 @@ func TestMihomoRuntimeConfigAddsReferencedBuiltInRuleProviders(t *testing.T) {
 		"type":     "http",
 		"behavior": "domain",
 		"format":   "mrs",
-		"url":      "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo-lite/geosite/google.mrs",
+		"url":      "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo-lite/geosite/google.mrs",
 		"path":     "./rule-providers/geo-lite_geosite_google.mrs",
 		"interval": 86400,
 	}
 	if !reflect.DeepEqual(provider, expected) {
 		t.Fatalf("provider = %#v, want %#v", provider, expected)
+	}
+}
+
+func TestMihomoRuntimeConfigUsesEmbeddedRuleProviders(t *testing.T) {
+	config := mihomoRuntimeConfig(repository.GlobalConfig{}, nil, nil, []repository.NormalizedRule{
+		{
+			Fields: map[string]any{"domain_suffix": []string{"example.com"}},
+			Raw:    []string{"RULE-SET,subconverter-example-abcd1234,Proxy"},
+			MihomoRuleProvider: &repository.MihomoRuleProviderResource{
+				Provider:   "subconverter-example-abcd1234",
+				SourceMode: repository.RuleAssetSourceModeRemote,
+				URL:        "https://example.com/example.list",
+				Behavior:   "classical",
+				Format:     "text",
+				Interval:   "86400",
+			},
+			Action:   "route",
+			Outbound: "Proxy",
+		},
+	}, nil, nil, "0.0.0.0:9090")
+
+	rules, ok := config["rules"].([]string)
+	if !ok {
+		t.Fatalf("rules = %#v, want []string", config["rules"])
+	}
+	expectedRules := []string{"RULE-SET,subconverter-example-abcd1234,Proxy"}
+	if !reflect.DeepEqual(rules, expectedRules) {
+		t.Fatalf("rules = %#v, want %#v", rules, expectedRules)
+	}
+
+	providers, ok := config["rule-providers"].(map[string]any)
+	if !ok {
+		t.Fatalf("rule-providers = %#v, want map", config["rule-providers"])
+	}
+	provider, ok := providers["subconverter-example-abcd1234"].(map[string]any)
+	if !ok {
+		t.Fatalf("embedded provider missing: %#v", providers)
+	}
+	expectedProvider := map[string]any{
+		"type":     "http",
+		"behavior": "classical",
+		"format":   "text",
+		"url":      "https://example.com/example.list",
+		"path":     "./rule-providers/subconverter-example-abcd1234.text",
+		"interval": "86400",
+	}
+	if !reflect.DeepEqual(provider, expectedProvider) {
+		t.Fatalf("provider = %#v, want %#v", provider, expectedProvider)
+	}
+}
+
+func TestMihomoRulesRenderSourceIPCidrFromNormalizedFields(t *testing.T) {
+	rules := mihomoRules([]repository.NormalizedRule{
+		{
+			Fields:   map[string]any{"source_ip_cidr": []string{"192.168.1.0/24", "10.0.0.0/8"}},
+			Outbound: "Proxy",
+		},
+	})
+
+	expected := []string{
+		"SRC-IP-CIDR,192.168.1.0/24,Proxy",
+		"SRC-IP-CIDR,10.0.0.0/8,Proxy",
+	}
+	if !reflect.DeepEqual(rules, expected) {
+		t.Fatalf("mihomoRules() = %#v, want %#v", rules, expected)
 	}
 }
 
@@ -410,7 +596,7 @@ func TestSingBoxDNSMatchesManagedPreviewShape(t *testing.T) {
 			{"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.1/15", "inet6_range": "fc00::/18"},
 		},
 		"rules": []map[string]any{
-			{"domain_suffix": []string{"lan"}, "geosite": []string{"private"}, "server": "default-1"},
+			{"domain_suffix": []string{"lan"}, "rule_set": []string{"geo/geosite/private"}, "server": "default-1"},
 			{"domain_suffix": []string{"example.com"}, "server": "default-1", "strategy": "ipv4_only", "client_subnet": "3.3.3.3/24"},
 			{"query_type": []string{"A", "AAAA"}, "server": "fakeip"},
 		},
@@ -471,6 +657,113 @@ func TestSingBoxDNSAddsRuntimeDetourToProxyServers(t *testing.T) {
 	}
 	if !reflect.DeepEqual(servers, expected) {
 		t.Fatalf("singBoxDNSServers() = %#v, want %#v", servers, expected)
+	}
+}
+
+func TestSingBoxDNSLetsFakeIPHandleLeakPreventionWhenEnabled(t *testing.T) {
+	config := repository.GlobalConfig{
+		Fields: map[string]any{
+			"dnsMode":             "fake-ip",
+			"dnsFakeIpEnabled":    true,
+			"dnsFakeIpFilterMode": "blacklist",
+		},
+		DNSServers: []repository.GlobalDNSServer{
+			{Name: "default-1", Role: "default", Protocol: "udp", Address: "223.5.5.5"},
+			{Name: "proxy-1", Role: "proxy", Protocol: "https", Address: "1.1.1.1", Path: "/dns-query"},
+		},
+	}
+
+	dns := singBoxDNS(config, runtimeCompileOptions{})
+	expectedRules := []map[string]any{
+		{"query_type": []string{"A", "AAAA"}, "server": "fakeip"},
+	}
+	if !reflect.DeepEqual(dns["rules"], expectedRules) {
+		t.Fatalf("dns rules = %#v, want %#v", dns["rules"], expectedRules)
+	}
+}
+
+func TestSingBoxDNSAddsDefaultLeakPreventionRuleWhenFakeIPDisabled(t *testing.T) {
+	config := repository.GlobalConfig{
+		Fields: map[string]any{
+			"dnsMode":          "fake-ip",
+			"dnsFakeIpEnabled": false,
+		},
+		DNSServers: []repository.GlobalDNSServer{
+			{Name: "default-1", Role: "default", Protocol: "udp", Address: "223.5.5.5"},
+			{Name: "proxy-1", Role: "proxy", Protocol: "https", Address: "1.1.1.1", Path: "/dns-query"},
+		},
+	}
+
+	dns := singBoxDNS(config, runtimeCompileOptions{})
+	expectedRules := []map[string]any{
+		{"rule_set": []string{"geo/geosite/geolocation-!cn"}, "server": "proxy-1"},
+	}
+	if !reflect.DeepEqual(dns["rules"], expectedRules) {
+		t.Fatalf("dns rules = %#v, want %#v", dns["rules"], expectedRules)
+	}
+}
+
+func TestSingBoxDNSConvertsGeositeRulesToRuleSets(t *testing.T) {
+	config := repository.GlobalConfig{
+		Fields: map[string]any{
+			"dnsFakeIpEnabled": false,
+		},
+		DNSServers: []repository.GlobalDNSServer{
+			{Name: "default-1", Role: "default", Protocol: "udp", Address: "223.5.5.5"},
+		},
+		DNSRules: []repository.GlobalDNSRule{
+			{Matcher: "geosite", Value: "cn", ServerName: "default-1", Strategy: "prefer_ipv4"},
+		},
+	}
+
+	dns := singBoxDNS(config, runtimeCompileOptions{})
+	expectedRules := []map[string]any{
+		{"rule_set": []string{"geo/geosite/cn"}, "server": "default-1", "strategy": "prefer_ipv4"},
+	}
+	if !reflect.DeepEqual(dns["rules"], expectedRules) {
+		t.Fatalf("dns rules = %#v, want %#v", dns["rules"], expectedRules)
+	}
+}
+
+func TestSingBoxRouteAddsDefaultDNSLeakPreventionRuleSet(t *testing.T) {
+	route := singBoxRoute(repository.GlobalConfig{
+		Fields: map[string]any{"dnsFakeIpEnabled": false},
+		DNSServers: []repository.GlobalDNSServer{
+			{Name: "default-1", Role: "default"},
+			{Name: "proxy-1", Role: "proxy", Protocol: "https", Address: "1.1.1.1"},
+		},
+	}, nil, nil, nil)
+
+	expectedRuleSets := []map[string]any{
+		{
+			"type":   "remote",
+			"tag":    "geo/geosite/geolocation-!cn",
+			"format": "binary",
+			"url":    "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-%21cn.srs",
+		},
+	}
+	if !reflect.DeepEqual(route["rule_set"], expectedRuleSets) {
+		t.Fatalf("route rule_set = %#v, want %#v", route["rule_set"], expectedRuleSets)
+	}
+}
+
+func TestSingBoxRouteAddsDNSGeositeRuleSets(t *testing.T) {
+	route := singBoxRoute(repository.GlobalConfig{
+		DNSRules: []repository.GlobalDNSRule{
+			{Matcher: "geosite", Value: "cn", ServerName: "default-1"},
+		},
+	}, nil, nil, nil)
+
+	expectedRuleSets := []map[string]any{
+		{
+			"type":   "remote",
+			"tag":    "geo/geosite/cn",
+			"format": "binary",
+			"url":    "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs",
+		},
+	}
+	if !reflect.DeepEqual(route["rule_set"], expectedRuleSets) {
+		t.Fatalf("route rule_set = %#v, want %#v", route["rule_set"], expectedRuleSets)
 	}
 }
 
@@ -563,7 +856,7 @@ func TestSingBoxDNSFakeIPRuleModeKeepsFilterOrder(t *testing.T) {
 	dns := singBoxDNS(config, runtimeCompileOptions{})
 	expectedRules := []map[string]any{
 		{"domain_suffix": []string{"example.com"}, "server": "default-1"},
-		{"geosite": []string{"gfw"}, "server": "fakeip"},
+		{"rule_set": []string{"geo/geosite/gfw"}, "server": "fakeip"},
 		{"server": "default-1"},
 	}
 	if !reflect.DeepEqual(dns["rules"], expectedRules) {
@@ -673,6 +966,40 @@ func TestSingBoxInboundTunDefaultsMissingAddress(t *testing.T) {
 	}
 }
 
+func TestSingBoxInboundTunAddsIPv6AddressWhenIPv6Enabled(t *testing.T) {
+	tun := singBoxInboundTun(repository.InboundTun{Address: []string{"172.19.0.1/30"}}, runtimeCompileOptions{IPv6Enabled: true})
+
+	if !reflect.DeepEqual(tun["address"], []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"}) {
+		t.Fatalf("tun address = %#v, want IPv4 and IPv6 interface addresses", tun["address"])
+	}
+}
+
+func TestSingBoxRuntimeConfigUsesGlobalIPv6ForDefaultTunAddress(t *testing.T) {
+	config := singBoxRuntimeConfig(
+		repository.GlobalConfig{
+			Fields: map[string]any{"ipv6": true},
+			Inbounds: []repository.ManagedInbound{{
+				Enabled: true,
+				Tag:     "tun-in",
+				Kind:    "tun",
+				Tun:     repository.InboundTun{Address: []string{"172.19.0.1/30"}},
+			}},
+		},
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		"127.0.0.1:9090",
+		runtimeCompileOptions{},
+	)
+
+	inbounds := config["inbounds"].([]map[string]any)
+	if !reflect.DeepEqual(inbounds[0]["address"], []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"}) {
+		t.Fatalf("tun address = %#v, want IPv4 and IPv6 interface addresses", inbounds[0]["address"])
+	}
+}
+
 func TestSingBoxTProxyInboundIsLinuxOnly(t *testing.T) {
 	supported := singBoxInboundSupportedOnCurrentOS("tproxy")
 	if runtime.GOOS == "linux" && !supported {
@@ -750,6 +1077,41 @@ func TestSingBoxRoutePrependsDefaultRules(t *testing.T) {
 	}
 }
 
+func TestSingBoxRuntimeConfigInjectsClashModes(t *testing.T) {
+	config := singBoxRuntimeConfig(
+		repository.GlobalConfig{Fields: map[string]any{"mode": "global"}},
+		nil,
+		nil,
+		nil,
+		nil,
+		nil,
+		"127.0.0.1:9090",
+		runtimeCompileOptions{},
+	)
+
+	experimental, ok := config["experimental"].(map[string]any)
+	if !ok {
+		t.Fatalf("experimental = %#v, want map", config["experimental"])
+	}
+	clashAPI, ok := experimental["clash_api"].(map[string]any)
+	if !ok {
+		t.Fatalf("clash_api = %#v, want map", experimental["clash_api"])
+	}
+	if clashAPI["default_mode"] != "Global" {
+		t.Fatalf("default_mode = %#v, want Global", clashAPI["default_mode"])
+	}
+
+	expectedTrailingDefaultRules := []map[string]any{
+		{"clash_mode": "Direct", "outbound": "DIRECT"},
+		{"clash_mode": "Global", "outbound": "DIRECT"},
+	}
+	route := config["route"].(map[string]any)
+	rules := route["rules"].([]map[string]any)
+	if !reflect.DeepEqual(rules[len(rules)-2:], expectedTrailingDefaultRules) {
+		t.Fatalf("trailing default route rules = %#v, want %#v", rules[len(rules)-2:], expectedTrailingDefaultRules)
+	}
+}
+
 func TestSingBoxRouteCanDisableDefaultQuicBlock(t *testing.T) {
 	route := singBoxRoute(repository.GlobalConfig{
 		Fields: map[string]any{"routeBlockQuic": false},
@@ -761,15 +1123,34 @@ func TestSingBoxRouteCanDisableDefaultQuicBlock(t *testing.T) {
 			"type": "logical",
 			"mode": "or",
 			"rules": []map[string]any{
-				{"protocol": []string{"dns"}},
+				{"protocol": "dns"},
 				{"port": 53},
 			},
 			"action": "hijack-dns",
 		},
 		{"ip_is_private": true, "outbound": "DIRECT"},
+		{"clash_mode": "Direct", "outbound": "DIRECT"},
+		{"clash_mode": "Global", "outbound": "DIRECT"},
 	}
 	if !reflect.DeepEqual(route["rules"], expectedRules) {
 		t.Fatalf("route rules = %#v, want %#v", route["rules"], expectedRules)
+	}
+}
+
+func TestSingBoxRouteBlocksEncryptedDNSAndStunByDefault(t *testing.T) {
+	rules := singBoxDefaultRouteRules()
+	expected := map[string]any{
+		"type": "logical",
+		"mode": "or",
+		"rules": []map[string]any{
+			{"port": 853},
+			{"network": "udp", "port": 443},
+			{"protocol": "stun"},
+		},
+		"action": "reject",
+	}
+	if !reflect.DeepEqual(rules[2], expected) {
+		t.Fatalf("default block rule = %#v, want %#v", rules[2], expected)
 	}
 }
 
@@ -787,6 +1168,57 @@ func TestSingBoxRulesNormalizeBuiltInOutboundTags(t *testing.T) {
 	}
 	if !reflect.DeepEqual(rules, expected) {
 		t.Fatalf("singBoxRules() = %#v, want %#v", rules, expected)
+	}
+}
+
+func TestSingBoxRulesKeepSourceIPCidr(t *testing.T) {
+	rules := singBoxRules([]repository.NormalizedRule{
+		{
+			Fields:   map[string]any{"source_ip_cidr": []string{"192.168.1.0/24"}},
+			Action:   "route",
+			Outbound: "Proxy",
+		},
+	})
+
+	expected := []map[string]any{
+		{"source_ip_cidr": []string{"192.168.1.0/24"}, "action": "route", "outbound": "Proxy"},
+	}
+	if !reflect.DeepEqual(rules, expected) {
+		t.Fatalf("singBoxRules() = %#v, want %#v", rules, expected)
+	}
+}
+
+func TestSingBoxRulesSkipUnsupportedRule(t *testing.T) {
+	rules := singBoxRules([]repository.NormalizedRule{
+		{
+			Raw:               []string{"RULE-SET,YouTube,Proxy"},
+			Action:            "route",
+			Outbound:          "Proxy",
+			UnsupportedCores:  []repository.Core{repository.CoreSingBox},
+			UnsupportedReason: "未匹配到内置 sing-box 规则集",
+		},
+		{
+			Fields:   map[string]any{"domain_suffix": []string{"example.com"}},
+			Action:   "route",
+			Outbound: "Proxy",
+		},
+	})
+
+	expected := []map[string]any{
+		{"domain_suffix": []string{"example.com"}, "action": "route", "outbound": "Proxy"},
+	}
+	if !reflect.DeepEqual(rules, expected) {
+		t.Fatalf("singBoxRules() = %#v, want %#v", rules, expected)
+	}
+}
+
+func TestSanitizeRuntimeRawRulesKeepsLogicalMihomoRule(t *testing.T) {
+	raw := "AND,((DST-PORT,443),(NETWORK,UDP),(NOT,((GEOSITE,cn))),(NOT,((GEOIP,CN)))),REJECT"
+	rules := sanitizeRuntimeRawRules([]string{raw}, runtimeAvailableOutbounds(nil, nil))
+
+	expected := []string{raw}
+	if !reflect.DeepEqual(rules, expected) {
+		t.Fatalf("sanitizeRuntimeRawRules() = %#v, want %#v", rules, expected)
 	}
 }
 
@@ -1108,14 +1540,14 @@ func TestSingBoxRouteAddsBuiltInGeoRuleSets(t *testing.T) {
 			"type":            "remote",
 			"tag":             "geoip-cn",
 			"format":          "binary",
-			"url":             "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
+			"url":             "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs",
 			"download_detour": "PROXY",
 		},
 		{
 			"type":            "remote",
 			"tag":             "geosite-geolocation-!cn",
 			"format":          "binary",
-			"url":             "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/geolocation-%21cn.srs",
+			"url":             "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/geolocation-%21cn.srs",
 			"download_detour": "PROXY",
 		},
 	}
@@ -1187,11 +1619,89 @@ func TestSingBoxRouteAddsReferencedBuiltInRuleSets(t *testing.T) {
 			"type":   "remote",
 			"tag":    "geo/geosite/cn",
 			"format": "binary",
-			"url":    "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
+			"url":    "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs",
 		},
 	}
 	if !reflect.DeepEqual(route["rule_set"], expected) {
 		t.Fatalf("route rule_set = %#v, want %#v", route["rule_set"], expected)
+	}
+}
+
+func TestSingBoxRouteSkipsUnknownPathRuleSetValues(t *testing.T) {
+	route := singBoxRoute(repository.GlobalConfig{}, []repository.NormalizedRule{
+		{Fields: map[string]any{"rule_set": []string{"Ruleset/GoogleFCM"}}, Action: "route", Outbound: "Proxy"},
+		{Fields: map[string]any{"rule_set": []string{"Ruleset/Sony"}}, Action: "route", Outbound: "Proxy"},
+		{Fields: map[string]any{"domain_suffix": []string{"example.com"}}, Action: "route", Outbound: "Proxy"},
+	}, nil, nil)
+
+	if _, exists := route["rule_set"]; exists {
+		t.Fatalf("route rule_set = %#v, want no generated remote rule sets for unknown paths", route["rule_set"])
+	}
+	rules, ok := route["rules"].([]map[string]any)
+	if !ok {
+		t.Fatalf("route rules = %#v, want []map", route["rules"])
+	}
+	for _, rule := range rules {
+		if reflect.DeepEqual(rule["rule_set"], []string{"Ruleset/GoogleFCM"}) ||
+			reflect.DeepEqual(rule["rule_set"], []string{"Ruleset/Sony"}) {
+			t.Fatalf("route kept unknown ACL4SSR rule-set rule: %#v", rules)
+		}
+	}
+}
+
+func TestSingBoxRouteAddsReferencedGeositeRuleSetTag(t *testing.T) {
+	route := singBoxRoute(repository.GlobalConfig{}, []repository.NormalizedRule{
+		{Fields: map[string]any{"rule_set": []string{"geosite-youtube"}}, Action: "route", Outbound: "Proxy"},
+	}, nil, nil)
+
+	expected := []map[string]any{
+		{
+			"type":   "remote",
+			"tag":    "geosite-youtube",
+			"format": "binary",
+			"url":    "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/youtube.srs",
+		},
+	}
+	if !reflect.DeepEqual(route["rule_set"], expected) {
+		t.Fatalf("route rule_set = %#v, want %#v", route["rule_set"], expected)
+	}
+}
+
+func TestSingBoxRouteAddsReferencedGoogleCNRuleSetTag(t *testing.T) {
+	route := singBoxRoute(repository.GlobalConfig{}, []repository.NormalizedRule{
+		{Fields: map[string]any{"rule_set": []string{"geosite-google-cn"}}, Action: "route", Outbound: "DIRECT"},
+	}, nil, nil)
+
+	expected := []map[string]any{
+		{
+			"type":   "remote",
+			"tag":    "geosite-google-cn",
+			"format": "binary",
+			"url":    "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/google-cn.srs",
+		},
+	}
+	if !reflect.DeepEqual(route["rule_set"], expected) {
+		t.Fatalf("route rule_set = %#v, want %#v", route["rule_set"], expected)
+	}
+}
+
+func TestSingBoxRouteSkipsUnmatchedRuleSetNames(t *testing.T) {
+	route := singBoxRoute(repository.GlobalConfig{}, []repository.NormalizedRule{
+		{Fields: map[string]any{"rule_set": []string{"GoogleCN"}}, Action: "route", Outbound: "DIRECT"},
+		{Fields: map[string]any{"rule_set": []string{"anker@!cn"}}, Action: "route", Outbound: "Proxy"},
+	}, nil, nil)
+
+	if _, exists := route["rule_set"]; exists {
+		t.Fatalf("route rule_set = %#v, want no generated rule sets", route["rule_set"])
+	}
+	rules, ok := route["rules"].([]map[string]any)
+	if !ok {
+		t.Fatalf("route rules = %#v, want []map", route["rules"])
+	}
+	for _, rule := range rules {
+		if _, exists := rule["rule_set"]; exists {
+			t.Fatalf("route kept unmatched rule_set rule: %#v", rules)
+		}
 	}
 }
 
