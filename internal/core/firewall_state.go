@@ -118,6 +118,7 @@ func cleanupRuntimeNetworkState(ctx context.Context, runner commandRunner) error
 	for _, name := range []string{"utun", "utun100", "utun1010", "Meta"} {
 		_, _ = runFirewallCommand(ctx, runner, "ip", []string{"link", "del", name}, nil)
 	}
+	_, _ = runFirewallCommand(ctx, runner, "/etc/init.d/dnsmasq", []string{"restart"}, nil)
 	return cleanupErr
 }
 

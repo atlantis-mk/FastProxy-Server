@@ -337,6 +337,7 @@ func TestMihomoRuntimeConfigMatchesStandardDefaultShape(t *testing.T) {
 		"    append-system-dns: false",
 		"experimental:",
 		"    sniff-tls-sni: true",
+		"find-process-mode: always",
 		"geox-url: {}",
 		"    write-to-system: true",
 		"    store-selected: true",
@@ -348,7 +349,6 @@ func TestMihomoRuntimeConfigMatchesStandardDefaultShape(t *testing.T) {
 
 	for _, unexpected := range []string{
 		"tcp-concurrent:",
-		"find-process-mode:",
 		"etag-support:",
 		"disable-keep-alive:",
 		"geodata-mode:",
@@ -360,12 +360,21 @@ func TestMihomoRuntimeConfigMatchesStandardDefaultShape(t *testing.T) {
 		"cache-algorithm:",
 		"use-system-hosts:",
 		"prefer-h3:",
-		"fallback-filter:",
 		"store-fake-ip:",
 	} {
 		if strings.Contains(output, unexpected) {
 			t.Fatalf("mihomo runtime output contains %q:\n%s", unexpected, output)
 		}
+	}
+}
+
+func TestMihomoRuntimeConfigCanOverrideFindProcessMode(t *testing.T) {
+	config := mihomoRuntimeConfig(repository.GlobalConfig{
+		Fields: map[string]any{"findProcessMode": "off"},
+	}, nil, nil, nil, nil, nil, "0.0.0.0:9090")
+
+	if config["find-process-mode"] != "off" {
+		t.Fatalf("find-process-mode = %#v, want off", config["find-process-mode"])
 	}
 }
 
@@ -446,7 +455,7 @@ func TestMihomoRuntimeConfigUsesEmbeddedRuleProviders(t *testing.T) {
 	if !ok {
 		t.Fatalf("rules = %#v, want []string", config["rules"])
 	}
-	expectedRules := []string{"RULE-SET,subconverter-example-abcd1234,Proxy"}
+	expectedRules := append(mihomoLocalDNSProcessDirectRules(), "RULE-SET,subconverter-example-abcd1234,Proxy")
 	if !reflect.DeepEqual(rules, expectedRules) {
 		t.Fatalf("rules = %#v, want %#v", rules, expectedRules)
 	}
@@ -481,11 +490,37 @@ func TestMihomoRulesRenderSourceIPCidrFromNormalizedFields(t *testing.T) {
 	})
 
 	expected := []string{
+		"PROCESS-NAME,smartdns,DIRECT",
+		"PROCESS-NAME,AdGuardHome,DIRECT",
 		"SRC-IP-CIDR,192.168.1.0/24,Proxy",
 		"SRC-IP-CIDR,10.0.0.0/8,Proxy",
 	}
 	if !reflect.DeepEqual(rules, expected) {
 		t.Fatalf("mihomoRules() = %#v, want %#v", rules, expected)
+	}
+}
+
+func TestMihomoRulesDefaultToSmartDNSDirectAndMatchDirect(t *testing.T) {
+	rules := mihomoRules(nil)
+	expected := []string{
+		"PROCESS-NAME,smartdns,DIRECT",
+		"PROCESS-NAME,AdGuardHome,DIRECT",
+		"MATCH,DIRECT",
+	}
+	if !reflect.DeepEqual(rules, expected) {
+		t.Fatalf("mihomoRules() = %#v, want %#v", rules, expected)
+	}
+}
+
+func TestMihomoDNSMapsRealIPModeToRedirHost(t *testing.T) {
+	dns := mihomoDNS(repository.GlobalConfig{
+		Fields: map[string]any{
+			"dnsMode": "real-ip",
+		},
+	})
+
+	if dns["enhanced-mode"] != "redir-host" {
+		t.Fatalf("enhanced-mode = %#v, want redir-host", dns["enhanced-mode"])
 	}
 }
 
@@ -503,6 +538,72 @@ func TestMihomoDNSUsesReachableNameserversForProxyServerLookup(t *testing.T) {
 	expected := []string{"223.5.5.5"}
 	if !reflect.DeepEqual(dns["proxy-server-nameserver"], expected) {
 		t.Fatalf("proxy-server-nameserver = %#v, want default DNS", dns["proxy-server-nameserver"])
+	}
+}
+
+func TestMihomoDNSUsesProxyServersAsFallback(t *testing.T) {
+	dns := mihomoDNS(repository.GlobalConfig{
+		Fields: map[string]any{
+			"dnsMode": "fake-ip",
+		},
+		DNSServers: []repository.GlobalDNSServer{
+			{Name: "default-1", Role: "default", Protocol: "udp", Address: "127.0.0.1", Port: "6053"},
+			{Name: "proxy-1", Role: "proxy", Protocol: "https", Address: "8.8.8.8", Path: "/dns-query"},
+		},
+	})
+
+	expectedFallback := []string{"https://8.8.8.8/dns-query"}
+	if !reflect.DeepEqual(dns["fallback"], expectedFallback) {
+		t.Fatalf("fallback = %#v, want proxy DNS", dns["fallback"])
+	}
+	expectedFilter := map[string]any{"geoip": true, "geoip-code": "CN"}
+	if !reflect.DeepEqual(dns["fallback-filter"], expectedFilter) {
+		t.Fatalf("fallback-filter = %#v, want CN geoip filter", dns["fallback-filter"])
+	}
+}
+
+func TestMihomoDNSPrefersConfiguredFallbackServers(t *testing.T) {
+	dns := mihomoDNS(repository.GlobalConfig{
+		Fields: map[string]any{
+			"dnsMode": "fake-ip",
+		},
+		DNSServers: []repository.GlobalDNSServer{
+			{Name: "fallback-1", Role: "fallback", Protocol: "https", Address: "1.1.1.1", Path: "/dns-query"},
+			{Name: "proxy-1", Role: "proxy", Protocol: "https", Address: "8.8.8.8", Path: "/dns-query"},
+		},
+	})
+
+	expected := []string{"https://1.1.1.1/dns-query"}
+	if !reflect.DeepEqual(dns["fallback"], expected) {
+		t.Fatalf("fallback = %#v, want configured fallback DNS", dns["fallback"])
+	}
+}
+
+func TestMihomoDNSOmitsDefaultServerPolicySoFallbackCanApply(t *testing.T) {
+	dns := mihomoDNS(repository.GlobalConfig{
+		Fields: map[string]any{
+			"dnsMode": "fake-ip",
+		},
+		DNSServers: []repository.GlobalDNSServer{
+			{Name: "default-1", Role: "default", Protocol: "udp", Address: "127.0.0.1", Port: "6053"},
+			{Name: "proxy-1", Role: "proxy", Protocol: "https", Address: "8.8.8.8", Path: "/dns-query"},
+		},
+		DNSRules: []repository.GlobalDNSRule{
+			{Matcher: "geosite", Value: "cn", ServerName: "default-1"},
+			{Matcher: "domain_suffix", Value: "example.com", ServerName: "proxy-1"},
+		},
+	})
+
+	policy, ok := dns["nameserver-policy"].(map[string][]string)
+	if !ok {
+		t.Fatalf("nameserver-policy = %#v, want map", dns["nameserver-policy"])
+	}
+	if _, ok := policy["geosite:cn"]; ok {
+		t.Fatalf("nameserver-policy kept default DNS rule and would bypass fallback: %#v", policy)
+	}
+	expectedProxyPolicy := []string{"https://8.8.8.8/dns-query"}
+	if !reflect.DeepEqual(policy["+.example.com"], expectedProxyPolicy) {
+		t.Fatalf("proxy policy = %#v, want %#v", policy["+.example.com"], expectedProxyPolicy)
 	}
 }
 
@@ -592,15 +693,20 @@ func TestSingBoxDNSMatchesManagedPreviewShape(t *testing.T) {
 	expected := map[string]any{
 		"servers": []map[string]any{
 			{"type": "udp", "tag": "default-1", "server": "223.5.5.5"},
-			{"type": "https", "tag": "proxy-2", "server": "dns.example.com", "server_port": 443, "path": "/query", "detour": "proxy", "client_subnet": "2.2.2.2/24", "tls": map[string]any{"insecure": true}},
+			{"type": "https", "tag": "proxy-1", "server": "dns.example.com", "server_port": 443, "path": "/query", "detour": "proxy", "client_subnet": "2.2.2.2/24", "tls": map[string]any{"insecure": true}},
 			{"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.1/15", "inet6_range": "fc00::/18"},
 		},
 		"rules": []map[string]any{
 			{"domain_suffix": []string{"lan"}, "rule_set": []string{"geo/geosite/private"}, "server": "default-1"},
-			{"domain_suffix": []string{"example.com"}, "server": "default-1", "strategy": "ipv4_only", "client_subnet": "3.3.3.3/24"},
+			{"domain_suffix": []string{"example.com"}, "action": "evaluate", "server": "default-1", "timeout": "1s", "client_subnet": "3.3.3.3/24"},
+			{"match_response": true, "response_rcode": "NOERROR", "action": "respond"},
+			{"match_response": true, "response_rcode": "NXDOMAIN", "action": "respond"},
+			{"domain_suffix": []string{"example.com"}, "server": "proxy-1", "strategy": "ipv4_only", "client_subnet": "3.3.3.3/24"},
+			{"clash_mode": "Direct", "server": "default-1"},
+			{"clash_mode": "global", "server": "fakeip"},
 			{"query_type": []string{"A", "AAAA"}, "server": "fakeip"},
 		},
-		"final":           "default-1",
+		"final":           "proxy-1",
 		"strategy":        "prefer_ipv4",
 		"disable_cache":   true,
 		"cache_capacity":  2048,
@@ -632,11 +738,10 @@ func TestSingBoxDNSOmitsFakeIPWhenDisabled(t *testing.T) {
 		"servers": []map[string]any{
 			{"type": "udp", "tag": "default-1", "server": "223.5.5.5"},
 		},
-		"final":           "default-1",
-		"strategy":        "prefer_ipv4",
-		"disable_cache":   false,
-		"timeout":         "10s",
-		"reverse_mapping": false,
+		"final":    "default-1",
+		"strategy": "prefer_ipv4",
+		"rules":    []map[string]any{{"clash_mode": "Direct", "server": "default-1"}},
+		"timeout":  "10s",
 	}
 	if !reflect.DeepEqual(dns, expected) {
 		t.Fatalf("singBoxDNS() = %#v, want %#v", dns, expected)
@@ -660,6 +765,35 @@ func TestSingBoxDNSAddsRuntimeDetourToProxyServers(t *testing.T) {
 	}
 }
 
+func TestSingBoxRuntimeConfigUsesFirstSelectorForProxyDNSDetour(t *testing.T) {
+	runtime := singBoxRuntimeConfig(
+		repository.GlobalConfig{
+			DNSServers: []repository.GlobalDNSServer{
+				{Name: "proxy-1", Role: "proxy", Protocol: "https", Address: "1.1.1.1", Path: "/dns-query"},
+			},
+		},
+		[]repository.NormalizedNode{{Tag: "node-a"}},
+		[]repository.NormalizedGroup{
+			{Tag: "Proxy", Type: "select", Outbounds: []string{"node-a"}},
+			{Tag: "DirectGroup", Type: "select", Outbounds: []string{"DIRECT"}},
+		},
+		[]repository.NormalizedRule{
+			{Fields: map[string]any{"geosite": []string{"cn"}}, Outbound: "DirectGroup"},
+			{Fields: map[string]any{"geosite": []string{"geolocation-!cn"}}, Outbound: "Proxy"},
+		},
+		nil,
+		nil,
+		"127.0.0.1:9090",
+		runtimeCompileOptions{},
+	)
+
+	dns := runtime["dns"].(map[string]any)
+	servers := dns["servers"].([]map[string]any)
+	if servers[0]["detour"] != "Proxy" {
+		t.Fatalf("proxy dns detour = %#v, want first selector", servers[0]["detour"])
+	}
+}
+
 func TestSingBoxDNSLetsFakeIPHandleLeakPreventionWhenEnabled(t *testing.T) {
 	config := repository.GlobalConfig{
 		Fields: map[string]any{
@@ -675,10 +809,15 @@ func TestSingBoxDNSLetsFakeIPHandleLeakPreventionWhenEnabled(t *testing.T) {
 
 	dns := singBoxDNS(config, runtimeCompileOptions{})
 	expectedRules := []map[string]any{
+		{"clash_mode": "Direct", "server": "default-1"},
+		{"clash_mode": "global", "server": "fakeip"},
 		{"query_type": []string{"A", "AAAA"}, "server": "fakeip"},
 	}
 	if !reflect.DeepEqual(dns["rules"], expectedRules) {
 		t.Fatalf("dns rules = %#v, want %#v", dns["rules"], expectedRules)
+	}
+	if dns["final"] != "proxy-1" {
+		t.Fatalf("dns final = %#v, want proxy-1", dns["final"])
 	}
 }
 
@@ -697,6 +836,8 @@ func TestSingBoxDNSAddsDefaultLeakPreventionRuleWhenFakeIPDisabled(t *testing.T)
 	dns := singBoxDNS(config, runtimeCompileOptions{})
 	expectedRules := []map[string]any{
 		{"rule_set": []string{"geo/geosite/geolocation-!cn"}, "server": "proxy-1"},
+		{"clash_mode": "Direct", "server": "default-1"},
+		{"clash_mode": "global", "server": "proxy-1"},
 	}
 	if !reflect.DeepEqual(dns["rules"], expectedRules) {
 		t.Fatalf("dns rules = %#v, want %#v", dns["rules"], expectedRules)
@@ -719,6 +860,88 @@ func TestSingBoxDNSConvertsGeositeRulesToRuleSets(t *testing.T) {
 	dns := singBoxDNS(config, runtimeCompileOptions{})
 	expectedRules := []map[string]any{
 		{"rule_set": []string{"geo/geosite/cn"}, "server": "default-1", "strategy": "prefer_ipv4"},
+		{"clash_mode": "Direct", "server": "default-1"},
+	}
+	if !reflect.DeepEqual(dns["rules"], expectedRules) {
+		t.Fatalf("dns rules = %#v, want %#v", dns["rules"], expectedRules)
+	}
+}
+
+func TestSingBoxDNSPrioritizesDefaultLeakPreventionBeforeUserGeositeRules(t *testing.T) {
+	config := repository.GlobalConfig{
+		Fields: map[string]any{
+			"dnsFakeIpEnabled": false,
+		},
+		DNSServers: []repository.GlobalDNSServer{
+			{Name: "default-1", Role: "default", Protocol: "udp", Address: "223.5.5.5"},
+			{Name: "proxy-1", Role: "proxy", Protocol: "https", Address: "1.1.1.1", Path: "/dns-query"},
+		},
+		DNSRules: []repository.GlobalDNSRule{
+			{Matcher: "geosite", Value: "cn", ServerName: "default-1", Strategy: "prefer_ipv4"},
+		},
+	}
+
+	dns := singBoxDNS(config, runtimeCompileOptions{})
+	expectedRules := []map[string]any{
+		{"rule_set": []string{"geo/geosite/geolocation-!cn"}, "server": "proxy-1"},
+		{"rule_set": []string{"geo/geosite/cn"}, "server": "default-1", "strategy": "prefer_ipv4"},
+		{"clash_mode": "Direct", "server": "default-1"},
+		{"clash_mode": "global", "server": "proxy-1"},
+	}
+	if !reflect.DeepEqual(dns["rules"], expectedRules) {
+		t.Fatalf("dns rules = %#v, want %#v", dns["rules"], expectedRules)
+	}
+}
+
+func TestSingBoxDNS14AddsDefaultServerFallbackRules(t *testing.T) {
+	config := repository.GlobalConfig{
+		Fields: map[string]any{
+			"dnsFakeIpEnabled": false,
+		},
+		DNSServers: []repository.GlobalDNSServer{
+			{Name: "default-1", Role: "default", Protocol: "udp", Address: "127.0.0.1", Port: "6053"},
+			{Name: "proxy-1", Role: "proxy", Protocol: "https", Address: "8.8.8.8", Path: "/dns-query"},
+		},
+		DNSRules: []repository.GlobalDNSRule{
+			{Matcher: "geosite", Value: "cn", ServerName: "default-1"},
+		},
+	}
+
+	dns := singBoxDNS(config, runtimeCompileOptions{SingBoxDNS14: true})
+	expectedRules := []map[string]any{
+		{"rule_set": []string{"geo/geosite/geolocation-!cn"}, "server": "proxy-1"},
+		{"rule_set": []string{"geo/geosite/cn"}, "action": "evaluate", "server": "default-1", "timeout": "1s"},
+		{"match_response": true, "response_rcode": "NOERROR", "action": "respond"},
+		{"match_response": true, "response_rcode": "NXDOMAIN", "action": "respond"},
+		{"rule_set": []string{"geo/geosite/cn"}, "server": "proxy-1"},
+		{"clash_mode": "Direct", "server": "default-1"},
+		{"clash_mode": "global", "server": "proxy-1"},
+	}
+	if !reflect.DeepEqual(dns["rules"], expectedRules) {
+		t.Fatalf("dns rules = %#v, want %#v", dns["rules"], expectedRules)
+	}
+}
+
+func TestSingBoxDNS13KeepsDefaultServerRulesCompatible(t *testing.T) {
+	config := repository.GlobalConfig{
+		Fields: map[string]any{
+			"dnsFakeIpEnabled": false,
+		},
+		DNSServers: []repository.GlobalDNSServer{
+			{Name: "default-1", Role: "default", Protocol: "udp", Address: "127.0.0.1", Port: "6053"},
+			{Name: "proxy-1", Role: "proxy", Protocol: "https", Address: "8.8.8.8", Path: "/dns-query"},
+		},
+		DNSRules: []repository.GlobalDNSRule{
+			{Matcher: "geosite", Value: "cn", ServerName: "default-1"},
+		},
+	}
+
+	dns := singBoxDNS(config, runtimeCompileOptions{SingBoxDNS14: false})
+	expectedRules := []map[string]any{
+		{"rule_set": []string{"geo/geosite/geolocation-!cn"}, "server": "proxy-1"},
+		{"rule_set": []string{"geo/geosite/cn"}, "server": "default-1"},
+		{"clash_mode": "Direct", "server": "default-1"},
+		{"clash_mode": "global", "server": "proxy-1"},
 	}
 	if !reflect.DeepEqual(dns["rules"], expectedRules) {
 		t.Fatalf("dns rules = %#v, want %#v", dns["rules"], expectedRules)
@@ -783,6 +1006,8 @@ func TestSingBoxDNSFakeIPWhitelistRulesUseFakeIPFirst(t *testing.T) {
 	dns := singBoxDNS(config, runtimeCompileOptions{})
 	expectedRules := []map[string]any{
 		{"rule_set": []string{"proxy-domain"}, "domain_suffix": []string{"example.com"}, "server": "fakeip"},
+		{"clash_mode": "Direct", "server": "default-1"},
+		{"clash_mode": "global", "server": "fakeip"},
 	}
 	if !reflect.DeepEqual(dns["rules"], expectedRules) {
 		t.Fatalf("dns rules = %#v, want %#v", dns["rules"], expectedRules)
@@ -811,6 +1036,8 @@ func TestSingBoxDNSFakeIPBlacklistCatchAllStaysAfterUserRules(t *testing.T) {
 	dns := singBoxDNS(config, runtimeCompileOptions{})
 	expectedRules := []map[string]any{
 		{"domain": []string{"special.example"}, "server": "policy-1"},
+		{"clash_mode": "Direct", "server": "default-1"},
+		{"clash_mode": "global", "server": "fakeip"},
 		{"query_type": []string{"A", "AAAA"}, "server": "fakeip"},
 	}
 	if !reflect.DeepEqual(dns["rules"], expectedRules) {
@@ -858,6 +1085,8 @@ func TestSingBoxDNSFakeIPRuleModeKeepsFilterOrder(t *testing.T) {
 		{"domain_suffix": []string{"example.com"}, "server": "default-1"},
 		{"rule_set": []string{"geo/geosite/gfw"}, "server": "fakeip"},
 		{"server": "default-1"},
+		{"clash_mode": "Direct", "server": "default-1"},
+		{"clash_mode": "global", "server": "fakeip"},
 	}
 	if !reflect.DeepEqual(dns["rules"], expectedRules) {
 		t.Fatalf("dns rules = %#v, want %#v", dns["rules"], expectedRules)
@@ -1062,16 +1291,39 @@ func TestSingBoxRouteFallsBackToFirstDNSResolver(t *testing.T) {
 	}
 }
 
-func TestSingBoxRoutePrependsDefaultRules(t *testing.T) {
+func TestSingBoxRoutePlacesDefaultBlockAfterSpecificRules(t *testing.T) {
 	route := singBoxRoute(repository.GlobalConfig{}, []repository.NormalizedRule{
 		{Fields: map[string]any{"domain": []string{"example.com"}}, Action: "route", Outbound: "DIRECT"},
+		{Action: "route", Outbound: "Proxy"},
 	}, nil, nil)
 
-	expectedRules := append(singBoxDefaultRouteRules(), map[string]any{
+	expectedRules := append([]map[string]any{}, singBoxDefaultRouteBaseRules()...)
+	expectedRules = append(expectedRules, map[string]any{
 		"domain":   []string{"example.com"},
 		"action":   "route",
 		"outbound": "DIRECT",
 	})
+	expectedRules = append(expectedRules, singBoxDefaultRouteFinalRules(repository.GlobalConfig{})...)
+	expectedRules = append(expectedRules, map[string]any{"action": "route", "outbound": "Proxy"})
+	if !reflect.DeepEqual(route["rules"], expectedRules) {
+		t.Fatalf("route rules = %#v, want %#v", route["rules"], expectedRules)
+	}
+}
+
+func TestSingBoxRouteLetsDomesticRulesMatchBeforeDefaultBlock(t *testing.T) {
+	route := singBoxRoute(repository.GlobalConfig{}, []repository.NormalizedRule{
+		{Fields: map[string]any{"geosite": []string{"cn"}}, Action: "route", Outbound: "DIRECT"},
+		{Action: "route", Outbound: "Proxy"},
+	}, nil, nil)
+
+	expectedRules := append([]map[string]any{}, singBoxDefaultRouteBaseRules()...)
+	expectedRules = append(expectedRules, map[string]any{
+		"rule_set": []string{"geosite-cn"},
+		"action":   "route",
+		"outbound": "DIRECT",
+	})
+	expectedRules = append(expectedRules, singBoxDefaultRouteFinalRules(repository.GlobalConfig{})...)
+	expectedRules = append(expectedRules, map[string]any{"action": "route", "outbound": "Proxy"})
 	if !reflect.DeepEqual(route["rules"], expectedRules) {
 		t.Fatalf("route rules = %#v, want %#v", route["rules"], expectedRules)
 	}
@@ -1093,6 +1345,13 @@ func TestSingBoxRuntimeConfigInjectsClashModes(t *testing.T) {
 	if !ok {
 		t.Fatalf("experimental = %#v, want map", config["experimental"])
 	}
+	cacheFile, ok := experimental["cache_file"].(map[string]any)
+	if !ok {
+		t.Fatalf("cache_file = %#v, want map", experimental["cache_file"])
+	}
+	if cacheFile["enabled"] != true || cacheFile["store_fakeip"] != true {
+		t.Fatalf("cache_file = %#v, want enabled and store_fakeip", cacheFile)
+	}
 	clashAPI, ok := experimental["clash_api"].(map[string]any)
 	if !ok {
 		t.Fatalf("clash_api = %#v, want map", experimental["clash_api"])
@@ -1101,14 +1360,11 @@ func TestSingBoxRuntimeConfigInjectsClashModes(t *testing.T) {
 		t.Fatalf("default_mode = %#v, want Global", clashAPI["default_mode"])
 	}
 
-	expectedTrailingDefaultRules := []map[string]any{
-		{"clash_mode": "Direct", "outbound": "DIRECT"},
-		{"clash_mode": "Global", "outbound": "DIRECT"},
-	}
 	route := config["route"].(map[string]any)
 	rules := route["rules"].([]map[string]any)
-	if !reflect.DeepEqual(rules[len(rules)-2:], expectedTrailingDefaultRules) {
-		t.Fatalf("trailing default route rules = %#v, want %#v", rules[len(rules)-2:], expectedTrailingDefaultRules)
+	expectedRules := singBoxDefaultRouteRules()
+	if !reflect.DeepEqual(rules, expectedRules) {
+		t.Fatalf("default route rules = %#v, want %#v", rules, expectedRules)
 	}
 }
 
@@ -1119,6 +1375,7 @@ func TestSingBoxRouteCanDisableDefaultQuicBlock(t *testing.T) {
 
 	expectedRules := []map[string]any{
 		{"action": "sniff"},
+		{"process_name": []string{"smartdns", "AdGuardHome"}, "port": 53, "action": "route", "outbound": "DIRECT"},
 		{
 			"type": "logical",
 			"mode": "or",
@@ -1130,7 +1387,6 @@ func TestSingBoxRouteCanDisableDefaultQuicBlock(t *testing.T) {
 		},
 		{"ip_is_private": true, "outbound": "DIRECT"},
 		{"clash_mode": "Direct", "outbound": "DIRECT"},
-		{"clash_mode": "Global", "outbound": "DIRECT"},
 	}
 	if !reflect.DeepEqual(route["rules"], expectedRules) {
 		t.Fatalf("route rules = %#v, want %#v", route["rules"], expectedRules)
@@ -1138,7 +1394,7 @@ func TestSingBoxRouteCanDisableDefaultQuicBlock(t *testing.T) {
 }
 
 func TestSingBoxRouteBlocksEncryptedDNSAndStunByDefault(t *testing.T) {
-	rules := singBoxDefaultRouteRules()
+	rules := singBoxDefaultRouteFinalRules(repository.GlobalConfig{})
 	expected := map[string]any{
 		"type": "logical",
 		"mode": "or",
@@ -1149,8 +1405,8 @@ func TestSingBoxRouteBlocksEncryptedDNSAndStunByDefault(t *testing.T) {
 		},
 		"action": "reject",
 	}
-	if !reflect.DeepEqual(rules[2], expected) {
-		t.Fatalf("default block rule = %#v, want %#v", rules[2], expected)
+	if !reflect.DeepEqual(rules[0], expected) {
+		t.Fatalf("default block rule = %#v, want %#v", rules[0], expected)
 	}
 }
 
@@ -1188,6 +1444,31 @@ func TestSingBoxRulesKeepSourceIPCidr(t *testing.T) {
 	}
 }
 
+func TestSingBoxRulesNormalizeBareIPCidr(t *testing.T) {
+	rules := singBoxRules([]repository.NormalizedRule{
+		{
+			Fields: map[string]any{
+				"ip_cidr":        []string{"23.156.152.251", "2001:db8::1"},
+				"source_ip_cidr": []string{"10.0.0.1"},
+			},
+			Action:   "route",
+			Outbound: "Proxy",
+		},
+	})
+
+	expected := []map[string]any{
+		{
+			"ip_cidr":        []string{"23.156.152.251/32", "2001:db8::1/128"},
+			"source_ip_cidr": []string{"10.0.0.1/32"},
+			"action":         "route",
+			"outbound":       "Proxy",
+		},
+	}
+	if !reflect.DeepEqual(rules, expected) {
+		t.Fatalf("singBoxRules() = %#v, want %#v", rules, expected)
+	}
+}
+
 func TestSingBoxRulesSkipUnsupportedRule(t *testing.T) {
 	rules := singBoxRules([]repository.NormalizedRule{
 		{
@@ -1217,6 +1498,23 @@ func TestSanitizeRuntimeRawRulesKeepsLogicalMihomoRule(t *testing.T) {
 	rules := sanitizeRuntimeRawRules([]string{raw}, runtimeAvailableOutbounds(nil, nil))
 
 	expected := []string{raw}
+	if !reflect.DeepEqual(rules, expected) {
+		t.Fatalf("sanitizeRuntimeRawRules() = %#v, want %#v", rules, expected)
+	}
+}
+
+func TestSanitizeRuntimeRawRulesNormalizesBareIPCIDR(t *testing.T) {
+	rules := sanitizeRuntimeRawRules([]string{
+		"IP-CIDR,23.156.152.251,🎯 全球直连",
+		"IP-CIDR6,2001:db8::1,🎯 全球直连",
+		"SRC-IP-CIDR,10.0.0.1,🎯 全球直连",
+	}, map[string]bool{"🎯 全球直连": true})
+
+	expected := []string{
+		"IP-CIDR,23.156.152.251/32,🎯 全球直连",
+		"IP-CIDR6,2001:db8::1/128,🎯 全球直连",
+		"SRC-IP-CIDR,10.0.0.1/32,🎯 全球直连",
+	}
 	if !reflect.DeepEqual(rules, expected) {
 		t.Fatalf("sanitizeRuntimeRawRules() = %#v, want %#v", rules, expected)
 	}
@@ -1313,6 +1611,117 @@ func TestSingBoxOutboundsKeepDialFieldsAndOmitMihomoOnlyCommonFields(t *testing.
 		if _, ok := proxy[key]; ok {
 			t.Fatalf("singBoxOutbounds()[2] leaked mihomo-only field %q: %#v", key, proxy)
 		}
+	}
+}
+
+func TestSingBoxOutboundsUseHysteria2ServerPorts(t *testing.T) {
+	outbounds := singBoxOutbounds([]repository.NormalizedNode{
+		{
+			Tag:        "hy2-node",
+			Type:       "hysteria2",
+			Server:     "hy2.example.com",
+			ServerPort: 35733,
+			Transport: map[string]any{
+				"password":            "secret",
+				"up_mbps":             80,
+				"down_mbps":           320,
+				"server_ports":        []string{"48000-50000"},
+				"hop_interval":        "5s",
+				"hop_interval_max":    "10s",
+				"mihomo_hop_interval": "5-10",
+				"obfs": map[string]any{
+					"type":     "salamander",
+					"password": "obfs-secret",
+				},
+			},
+		},
+	}, nil)
+
+	proxy := outbounds[2]
+	expected := map[string]any{
+		"type":         "hysteria2",
+		"tag":          "hy2-node",
+		"server":       "hy2.example.com",
+		"password":     "secret",
+		"up_mbps":      80,
+		"down_mbps":    320,
+		"server_ports": []string{"48000-50000"},
+		"hop_interval": "5s",
+		"obfs": map[string]any{
+			"type":     "salamander",
+			"password": "obfs-secret",
+		},
+	}
+	if !reflect.DeepEqual(proxy, expected) {
+		t.Fatalf("singBoxOutbounds()[2] = %#v, want %#v", proxy, expected)
+	}
+	if _, ok := proxy["server_port"]; ok {
+		t.Fatalf("singBoxOutbounds()[2] should not include server_port when server_ports is set: %#v", proxy)
+	}
+	if _, ok := proxy["hop_interval_max"]; ok {
+		t.Fatalf("singBoxOutbounds()[2] should filter hop_interval_max for current sing-box compatibility: %#v", proxy)
+	}
+}
+
+func TestMihomoProxiesUseHysteria2PortHopping(t *testing.T) {
+	proxies := mihomoProxies([]repository.NormalizedNode{
+		{
+			Tag:        "hy2-node",
+			Type:       "hysteria2",
+			Server:     "hy2.example.com",
+			ServerPort: 35733,
+			Transport: map[string]any{
+				"password":            "secret",
+				"up_mbps":             80,
+				"down_mbps":           320,
+				"server_ports":        []string{"48000-50000"},
+				"hop_interval":        "5s",
+				"hop_interval_max":    "10s",
+				"mihomo_hop_interval": "5-10",
+				"obfs": map[string]any{
+					"type":     "salamander",
+					"password": "obfs-secret",
+				},
+				"tls": map[string]any{
+					"enabled":     true,
+					"server_name": "hy2.example.com",
+					"alpn":        []string{"h3", "h2"},
+					"utls": map[string]any{
+						"enabled":     true,
+						"fingerprint": "chrome",
+					},
+				},
+			},
+			Raw: map[string]any{
+				"uri":      "hysteria2://secret@example.com",
+				"fm":       map[string]any{"quicParams": map[string]any{"congestion": "bbr"}},
+				"mport":    "48000-50000",
+				"fp":       "chrome",
+				"security": "tls",
+			},
+		},
+	})
+
+	expected := map[string]any{
+		"name":               "hy2-node",
+		"type":               "hysteria2",
+		"server":             "hy2.example.com",
+		"port":               35733,
+		"password":           "secret",
+		"up":                 80,
+		"down":               320,
+		"ports":              "48000-50000",
+		"hop-interval":       "5-10",
+		"obfs":               "salamander",
+		"obfs-password":      "obfs-secret",
+		"tls":                true,
+		"servername":         "hy2.example.com",
+		"sni":                "hy2.example.com",
+		"alpn":               []string{"h3", "h2"},
+		"client-fingerprint": "chrome",
+	}
+	if !reflect.DeepEqual(proxies[0], expected) {
+		t.Fatalf("mihomoProxies()[0] = %#v, want %#v", proxies[0], expected)
 	}
 }
 
@@ -1594,18 +2003,18 @@ func TestSingBoxConfiguredRuleSetsUseDownloadDetourForRemoteSources(t *testing.T
 	}
 }
 
-func TestSingBoxRuleSetDownloadDetourPrefersProxyRuleOutbound(t *testing.T) {
+func TestSingBoxRuleSetDownloadDetourPrefersFirstSelector(t *testing.T) {
 	detour := singBoxRuleSetDownloadDetour(
 		[]repository.NormalizedNode{{Tag: "node-a"}},
-		[]repository.NormalizedGroup{{Tag: "Proxy"}, {Tag: "Auto"}},
+		[]repository.NormalizedGroup{{Tag: "Proxy", Type: "select"}, {Tag: "Auto", Type: "url-test"}},
 		[]repository.NormalizedRule{
 			{Fields: map[string]any{"geoip": []string{"cn"}}, Outbound: "DIRECT"},
-			{Fields: map[string]any{"geosite": []string{"geolocation-!cn"}}, Outbound: "Proxy"},
+			{Fields: map[string]any{"geosite": []string{"geolocation-!cn"}}, Outbound: "node-a"},
 		},
 	)
 
 	if detour != "Proxy" {
-		t.Fatalf("detour = %q, want proxy rule outbound", detour)
+		t.Fatalf("detour = %q, want first selector", detour)
 	}
 }
 

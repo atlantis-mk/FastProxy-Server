@@ -1568,7 +1568,6 @@ func defaultGlobalDNSServers() []GlobalDNSServer {
 		protocol, address, port, path := parseDefaultDNSServerEndpoint(endpoint)
 		servers = append(servers, GlobalDNSServer{
 			ID:       fmt.Sprintf("dns-default-%d", index+1),
-			Name:     fmt.Sprintf("default-%d", index+1),
 			Role:     "default",
 			Protocol: protocol,
 			Address:  address,
@@ -1640,7 +1639,6 @@ func proxyDefaultDNSServers() []GlobalDNSServer {
 		protocol, address, port, path := parseDefaultDNSServerEndpoint(endpoint)
 		servers = append(servers, GlobalDNSServer{
 			ID:       fmt.Sprintf("dns-proxy-%d", index+1),
-			Name:     fmt.Sprintf("proxy-%d", index+1),
 			Role:     "proxy",
 			Protocol: protocol,
 			Address:  address,
@@ -2798,7 +2796,7 @@ func normalizeGlobalDNSServers(input []GlobalDNSServer) []GlobalDNSServer {
 	servers := make([]GlobalDNSServer, 0, len(input))
 	for index, server := range input {
 		server.ID = strings.TrimSpace(server.ID)
-		server.Name = strings.TrimSpace(server.Name)
+		server.Name = ""
 		server.Role = strings.TrimSpace(server.Role)
 		server.Protocol = strings.TrimSpace(server.Protocol)
 		server.Address = strings.TrimSpace(server.Address)

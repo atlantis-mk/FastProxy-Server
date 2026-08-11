@@ -98,6 +98,7 @@ func TestCleanupRuntimeNetworkStateRemovesMihomoArtifacts(t *testing.T) {
 		commandKey("ip", []string{"link", "del", "utun100"}):                                    nil,
 		commandKey("ip", []string{"link", "del", "utun1010"}):                                   nil,
 		commandKey("ip", []string{"link", "del", "Meta"}):                                       nil,
+		commandKey("/etc/init.d/dnsmasq", []string{"restart"}):                                  nil,
 	}}
 	for _, pref := range []string{"9000", "9001", "9002", "9010"} {
 		runner.outputs[commandKey("ip", []string{"rule", "del", "pref", pref})] = nil
@@ -113,6 +114,7 @@ func TestCleanupRuntimeNetworkStateRemovesMihomoArtifacts(t *testing.T) {
 		{Name: "nft", Args: []string{"delete", "rule", "inet", "fw4", "forward", "handle", "42"}},
 		{Name: "ip", Args: []string{"route", "flush", "table", "2022"}},
 		{Name: "ip", Args: []string{"link", "del", "utun100"}},
+		{Name: "/etc/init.d/dnsmasq", Args: []string{"restart"}},
 	} {
 		if findCall(runner.calls, expected.Name, expected.Args) == nil {
 			t.Fatalf("missing cleanup call %s %v in %#v", expected.Name, expected.Args, runner.calls)

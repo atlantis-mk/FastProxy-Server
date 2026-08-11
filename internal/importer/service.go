@@ -1208,9 +1208,11 @@ func parseClashRule(line string) (repository.NormalizedRule, string, error) {
 		if hasClashRuleExtra(extras, "src") {
 			fieldName = "source_ip_cidr"
 		}
-		return newSingBoxRule(map[string]any{fieldName: trimStrings(args)}, outbound, raw), warning, nil
+		cidrs := normalizeClashCIDRs(args)
+		return newSingBoxRule(map[string]any{fieldName: cidrs}, outbound, clashRuleRawLine(ruleType, cidrs, outbound, extras)), warning, nil
 	case "SRC-IP-CIDR":
-		return newSingBoxRule(map[string]any{"source_ip_cidr": trimStrings(args)}, outbound, raw), warning, nil
+		cidrs := normalizeClashCIDRs(args)
+		return newSingBoxRule(map[string]any{"source_ip_cidr": cidrs}, outbound, clashRuleRawLine(ruleType, cidrs, outbound, extras)), warning, nil
 	case "GEOIP":
 		return newSingBoxRule(map[string]any{"geoip": trimStrings(args)}, outbound, raw), appendWarning(warning, "GEOIP is deprecated in sing-box and was kept as geoip"), nil
 	case "SRC-GEOIP":
@@ -1284,6 +1286,38 @@ func splitClashRuleParts(ruleType string, parts []string) ([]string, string, []s
 		return nil, "", nil, fmt.Errorf("invalid clash rule %q", strings.Join(parts, ","))
 	}
 	return []string{strings.TrimSpace(parts[1])}, normalizeClashRuleOutbound(parts[2]), trimStrings(parts[3:]), nil
+}
+
+func clashRuleRawLine(ruleType string, args []string, outbound string, extras []string) string {
+	parts := []string{ruleType}
+	parts = append(parts, args...)
+	parts = append(parts, outbound)
+	parts = append(parts, extras...)
+	return strings.Join(parts, ",")
+}
+
+func normalizeClashCIDRs(values []string) []string {
+	values = trimStrings(values)
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		result = append(result, normalizeBareIPCIDR(value))
+	}
+	return result
+}
+
+func normalizeBareIPCIDR(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || strings.Contains(trimmed, "/") {
+		return trimmed
+	}
+	ip := net.ParseIP(trimmed)
+	if ip == nil {
+		return trimmed
+	}
+	if ip.To4() != nil {
+		return trimmed + "/32"
+	}
+	return trimmed + "/128"
 }
 
 func hasClashRuleExtra(values []string, target string) bool {
@@ -1615,13 +1649,9 @@ func parseNodeURI(raw string) (repository.NormalizedNode, string, error) {
 	}
 	switch parsed.Scheme {
 	case "trojan", "vless":
-		host, port, err := net.SplitHostPort(parsed.Host)
+		host, portValue, err := parseNodeURIHostPort(parsed, 0)
 		if err != nil {
-			return repository.NormalizedNode{}, "", fmt.Errorf("%w: invalid host %q", ErrInvalidImport, parsed.Host)
-		}
-		portValue, err := strconv.Atoi(port)
-		if err != nil {
-			return repository.NormalizedNode{}, "", fmt.Errorf("%w: invalid port %q", ErrInvalidImport, port)
+			return repository.NormalizedNode{}, "", err
 		}
 		return withNodeDefaults(repository.NormalizedNode{
 			Tag:        strings.TrimPrefix(parsed.Fragment, "#"),
@@ -1656,9 +1686,216 @@ func parseNodeURI(raw string) (repository.NormalizedNode, string, error) {
 		}), "", nil
 	case "ss":
 		return parseShadowsocksNode(raw)
+	case "hysteria2", "hy2":
+		return parseHysteria2Node(raw, parsed)
 	default:
 		return repository.NormalizedNode{}, "", fmt.Errorf("%w: unsupported node scheme %q", ErrInvalidImport, parsed.Scheme)
 	}
+}
+
+func parseHysteria2Node(raw string, parsed *url.URL) (repository.NormalizedNode, string, error) {
+	host, portValue, err := parseNodeURIHostPort(parsed, 443)
+	if err != nil {
+		return repository.NormalizedNode{}, "", err
+	}
+	query := parsed.Query()
+	password := parsed.User.Username()
+	if password == "" {
+		password = query.Get("password")
+	}
+	transport := map[string]any{
+		"password": password,
+	}
+	if upMbps := intQueryValue(query, "up", "up_mbps"); upMbps > 0 {
+		transport["up_mbps"] = upMbps
+	}
+	if downMbps := intQueryValue(query, "down", "down_mbps"); downMbps > 0 {
+		transport["down_mbps"] = downMbps
+	}
+	fm := parseJSONQueryValue(query.Get("fm"))
+	if ports := splitCommaValues(fallbackName(firstQueryValue(query, "mport", "ports", "server_ports"), hysteria2FMUDPHopValue(fm, "ports"))); len(ports) > 0 {
+		transport["server_ports"] = ports
+	}
+	applyHysteria2HopInterval(transport, fallbackName(firstQueryValue(query, "hop-interval", "hop_interval"), hysteria2FMUDPHopValue(fm, "interval")))
+	if obfsPassword := firstQueryValue(query, "obfs-password", "obfs_password"); obfsPassword != "" {
+		transport["obfs"] = map[string]any{
+			"type":     fallbackName(firstQueryValue(query, "obfs"), "salamander"),
+			"password": obfsPassword,
+		}
+	}
+	tls := map[string]any{"enabled": true}
+	if serverName := firstQueryValue(query, "sni", "peer"); serverName != "" {
+		tls["server_name"] = serverName
+	}
+	if alpn := splitCommaValues(query.Get("alpn")); len(alpn) > 0 {
+		tls["alpn"] = alpn
+	}
+	if fingerprint := firstQueryValue(query, "fp", "fingerprint"); fingerprint != "" {
+		tls["utls"] = map[string]any{
+			"enabled":     true,
+			"fingerprint": fingerprint,
+		}
+	}
+	if boolQueryValue(query, "insecure") || boolQueryValue(query, "allowInsecure") || boolQueryValue(query, "skip-cert-verify") {
+		tls["insecure"] = true
+	}
+	if strings.EqualFold(strings.TrimSpace(query.Get("security")), "none") {
+		delete(tls, "enabled")
+	} else {
+		transport["tls"] = tls
+	}
+
+	rawFields := map[string]any{
+		"uri":      raw,
+		"name":     strings.TrimPrefix(parsed.Fragment, "#"),
+		"type":     "hysteria2",
+		"server":   host,
+		"port":     portValue,
+		"password": password,
+	}
+	if fm != nil {
+		rawFields["fm"] = fm
+	}
+	for key, values := range query {
+		if key == "fm" {
+			continue
+		}
+		if len(values) == 1 {
+			rawFields[key] = values[0]
+			continue
+		}
+		rawFields[key] = values
+	}
+
+	return withNodeDefaults(repository.NormalizedNode{
+		Tag:        fallbackName(strings.TrimPrefix(parsed.Fragment, "#"), host),
+		Type:       "hysteria2",
+		Server:     host,
+		ServerPort: portValue,
+		Source:     "plain-node",
+		Transport:  transport,
+		Raw:        rawFields,
+	}), "", nil
+}
+
+func applyHysteria2HopInterval(transport map[string]any, value string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	transport["mihomo_hop_interval"] = value
+	hopInterval := singBoxHysteria2HopInterval(value)
+	if hopInterval != "" {
+		transport["hop_interval"] = hopInterval
+	}
+}
+
+func singBoxHysteria2HopInterval(value string) string {
+	parts := strings.SplitN(strings.TrimSpace(value), "-", 2)
+	return singBoxHysteria2HopDuration(parts[0])
+}
+
+func singBoxHysteria2HopDuration(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if _, err := strconv.ParseFloat(value, 64); err == nil {
+		return value + "s"
+	}
+	return value
+}
+
+func hysteria2FMUDPHopValue(fm any, key string) string {
+	fmMap, ok := fm.(map[string]any)
+	if !ok {
+		return ""
+	}
+	quicParams, ok := fmMap["quicParams"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	udpHop, ok := quicParams["udpHop"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	switch value := udpHop[key].(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case nil:
+		return ""
+	default:
+		return strings.TrimSpace(fmt.Sprint(value))
+	}
+}
+
+func parseNodeURIHostPort(parsed *url.URL, defaultPort int) (string, int, error) {
+	host := strings.TrimSpace(parsed.Hostname())
+	if host == "" {
+		return "", 0, fmt.Errorf("%w: invalid host %q", ErrInvalidImport, parsed.Host)
+	}
+	port := strings.TrimSpace(parsed.Port())
+	if port == "" {
+		if defaultPort <= 0 {
+			return "", 0, fmt.Errorf("%w: invalid host %q", ErrInvalidImport, parsed.Host)
+		}
+		return host, defaultPort, nil
+	}
+	portValue, err := strconv.Atoi(port)
+	if err != nil || portValue <= 0 {
+		return "", 0, fmt.Errorf("%w: invalid port %q", ErrInvalidImport, port)
+	}
+	return host, portValue, nil
+}
+
+func firstQueryValue(query url.Values, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(query.Get(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func splitCommaValues(value string) []string {
+	parts := strings.Split(value, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
+func boolQueryValue(query url.Values, key string) bool {
+	switch strings.ToLower(strings.TrimSpace(query.Get(key))) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+func intQueryValue(query url.Values, keys ...string) int {
+	for _, key := range keys {
+		if value := intValue(query.Get(key)); value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func parseJSONQueryValue(value string) any {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(value), &parsed); err != nil {
+		return value
+	}
+	return parsed
 }
 
 func parseShadowsocksNode(raw string) (repository.NormalizedNode, string, error) {

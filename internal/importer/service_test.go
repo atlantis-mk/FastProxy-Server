@@ -729,3 +729,96 @@ func TestImportPlainNodesDoesNotOverwriteExistingStateOnFailure(t *testing.T) {
 		t.Fatalf("existing node set was unexpectedly replaced: %+v", nodeSets[0])
 	}
 }
+
+func TestParseClashRulesNormalizesBareIPCIDR(t *testing.T) {
+	normalized, _, err := ParseClashContent(`
+rules:
+  - IP-CIDR,23.156.152.251,🎯 全球直连
+  - IP-CIDR6,2001:db8::1,🎯 全球直连
+  - SRC-IP-CIDR,10.0.0.1,🎯 全球直连
+`)
+	if err != nil {
+		t.Fatalf("ParseClashContent() error = %v", err)
+	}
+	if len(normalized.Rules) != 2 {
+		t.Fatalf("len(normalized.Rules) = %d, want destination and source rules", len(normalized.Rules))
+	}
+	destinationRule := normalized.Rules[0]
+	if !reflect.DeepEqual(destinationRule.Fields["ip_cidr"], []string{"23.156.152.251/32", "2001:db8::1/128"}) {
+		t.Fatalf("ip_cidr = %#v", destinationRule.Fields["ip_cidr"])
+	}
+	sourceRule := normalized.Rules[1]
+	if !reflect.DeepEqual(sourceRule.Fields["source_ip_cidr"], []string{"10.0.0.1/32"}) {
+		t.Fatalf("source_ip_cidr = %#v", sourceRule.Fields["source_ip_cidr"])
+	}
+	expectedDestinationRaw := []string{
+		"IP-CIDR,23.156.152.251/32,🎯 全球直连",
+		"IP-CIDR6,2001:db8::1/128,🎯 全球直连",
+	}
+	if !reflect.DeepEqual(destinationRule.Raw, expectedDestinationRaw) {
+		t.Fatalf("destination raw = %#v, want %#v", destinationRule.Raw, expectedDestinationRaw)
+	}
+	if !reflect.DeepEqual(sourceRule.Raw, []string{"SRC-IP-CIDR,10.0.0.1/32,🎯 全球直连"}) {
+		t.Fatalf("source raw = %#v", sourceRule.Raw)
+	}
+}
+
+func TestImportPlainNodesParsesHysteria2ShareURI(t *testing.T) {
+	store, err := repository.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	service := NewService(store)
+
+	result, err := service.ImportPlainNodes(PlainNodeImportInput{
+		Name:    "Hysteria2",
+		Content: "hysteria2://8grg9fxszsw8sbeg@3x.atla.cc.cd:35733?alpn=h3%2Ch2%2Chttp%2F1.1&fm=%7B%22quicParams%22%3A%7B%22congestion%22%3A%22bbr%22%2C%22debug%22%3Afalse%2C%22disablePathMTUDiscovery%22%3Afalse%2C%22initConnectionReceiveWindow%22%3A20971520%2C%22initStreamReceiveWindow%22%3A8388608%2C%22keepAlivePeriod%22%3A10%2C%22maxConnectionReceiveWindow%22%3A20971520%2C%22maxIdleTimeout%22%3A30%2C%22maxIncomingStreams%22%3A1024%2C%22maxStreamReceiveWindow%22%3A8388608%2C%22udpHop%22%3A%7B%22interval%22%3A%225-10%22%2C%22ports%22%3A%2248000-50000%22%7D%7D%2C%22udp%22%3A%5B%7B%22settings%22%3A%7B%22password%22%3A%22m7sva0smezr7ol88%22%7D%2C%22type%22%3A%22salamander%22%7D%5D%7D&fp=chrome&mport=48000-50000&obfs=salamander&obfs-password=m7sva0smezr7ol88&security=tls&sni=3x.atla.cc.cd&up=80&down=320#-fn13abriju",
+	})
+	if err != nil {
+		t.Fatalf("ImportPlainNodes() error = %v", err)
+	}
+	if result.NodeSet == nil || len(result.NodeSet.Nodes) != 1 {
+		t.Fatalf("nodes = %+v, want one hysteria2 node", result.NodeSet)
+	}
+	node := result.NodeSet.Nodes[0]
+	if node.Tag != "-fn13abriju" || node.Type != "hysteria2" || node.Server != "3x.atla.cc.cd" || node.ServerPort != 35733 {
+		t.Fatalf("node identity = %+v", node)
+	}
+	if node.Transport["password"] != "8grg9fxszsw8sbeg" {
+		t.Fatalf("password = %#v", node.Transport["password"])
+	}
+	if node.Transport["up_mbps"] != 80 || node.Transport["down_mbps"] != 320 {
+		t.Fatalf("bandwidth = %#v/%#v", node.Transport["up_mbps"], node.Transport["down_mbps"])
+	}
+	if !reflect.DeepEqual(node.Transport["server_ports"], []string{"48000-50000"}) {
+		t.Fatalf("server_ports = %#v", node.Transport["server_ports"])
+	}
+	if node.Transport["mihomo_hop_interval"] != "5-10" || node.Transport["hop_interval"] != "5s" {
+		t.Fatalf("hop interval fields = %#v", node.Transport)
+	}
+	if _, ok := node.Transport["hop_interval_max"]; ok {
+		t.Fatalf("hop_interval_max should not be generated for current sing-box compatibility: %#v", node.Transport)
+	}
+	obfs, ok := node.Transport["obfs"].(map[string]any)
+	if !ok || obfs["type"] != "salamander" || obfs["password"] != "m7sva0smezr7ol88" {
+		t.Fatalf("obfs = %#v", node.Transport["obfs"])
+	}
+	tls, ok := node.Transport["tls"].(map[string]any)
+	if !ok || tls["server_name"] != "3x.atla.cc.cd" {
+		t.Fatalf("tls = %#v", node.Transport["tls"])
+	}
+	if !reflect.DeepEqual(tls["alpn"], []string{"h3", "h2", "http/1.1"}) {
+		t.Fatalf("tls.alpn = %#v", tls["alpn"])
+	}
+	utls, ok := tls["utls"].(map[string]any)
+	if !ok || utls["fingerprint"] != "chrome" {
+		t.Fatalf("tls.utls = %#v", tls["utls"])
+	}
+	fm, ok := node.Raw["fm"].(map[string]any)
+	if !ok {
+		t.Fatalf("raw.fm = %#v, want parsed object", node.Raw["fm"])
+	}
+	if _, ok := fm["quicParams"].(map[string]any); !ok {
+		t.Fatalf("raw.fm.quicParams = %#v", fm["quicParams"])
+	}
+}

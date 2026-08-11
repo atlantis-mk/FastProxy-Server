@@ -199,7 +199,7 @@ func TestUpdateGlobalConfigPersistsAllConfigSections(t *testing.T) {
 	body := bytes.NewBufferString(`{
 		"fields":{"allowLan":true,"bindAddress":"*","networkStrategy":"fallback"},
 		"dnsServers":[{"id":" local ","name":" local ","role":" default ","protocol":" udp ","address":" 223.5.5.5 ","port":" 53 "}],
-		"dnsRules":[{"id":" cn ","matcher":" geosite ","value":" cn ","serverName":" local "}],
+		"dnsRules":[{"id":" cn ","matcher":" geosite ","value":" cn ","serverName":" default-1 "}],
 		"inbounds":[{"id":"mixed","enabled":true,"tag":"mixed-in","kind":"mixed","listen":{"address":"0.0.0.0","port":7890}}]
 	}`)
 	request := httptest.NewRequest(http.MethodPut, "/api/repository/config", body)
@@ -217,10 +217,10 @@ func TestUpdateGlobalConfigPersistsAllConfigSections(t *testing.T) {
 	if updated.Fields["networkStrategy"] != "fallback" {
 		t.Fatalf("fields = %#v, want saved network config", updated.Fields)
 	}
-	if len(updated.DNSServers) != 1 || updated.DNSServers[0].Name != "local" || updated.DNSServers[0].Address != "223.5.5.5" {
+	if len(updated.DNSServers) != 1 || updated.DNSServers[0].Name != "" || updated.DNSServers[0].Address != "223.5.5.5" {
 		t.Fatalf("dnsServers = %#v, want normalized server", updated.DNSServers)
 	}
-	if len(updated.DNSRules) != 1 || updated.DNSRules[0].Matcher != "geosite" || updated.DNSRules[0].ServerName != "local" {
+	if len(updated.DNSRules) != 1 || updated.DNSRules[0].Matcher != "geosite" || updated.DNSRules[0].ServerName != "default-1" {
 		t.Fatalf("dnsRules = %#v, want normalized rule", updated.DNSRules)
 	}
 	if len(updated.Inbounds) != 1 || updated.Inbounds[0].Tag != "mixed-in" {
